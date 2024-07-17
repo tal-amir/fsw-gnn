@@ -153,6 +153,7 @@ class SW_conv(MessagePassing):
         # Convert edge_index to sparse adjacency matrix
         adj = pyg.utils.to_torch_coo_tensor(edge_index, edge_attr=None, size=n, is_coalesced=False)
         adj = adj.to(vertex_features.dtype)
+        adj.requires_grad_(False)
 
         # Add weighted self-loops
         if self.self_loop_weight > 0:
@@ -161,6 +162,8 @@ class SW_conv(MessagePassing):
             adj += torch.sparse_coo_tensor(indices, values, (n, n))
             adj.coalesce()
             in_degrees = torch.sum(adj, dim=-1, keepdim=True).to_dense()
+        else:
+            adj.coalesce()
 
         # Aggregate neighboring vertex features
         emb = self.sw_embed(X=vertex_features, W=adj, graph_mode=True, serialize_num_slices=None)
