@@ -35,8 +35,8 @@ class SW_conv(MessagePassing):
     #                   Default: 1
     #
     # bias:           if set to true, the MLP uses a bias vector.
-    #                 to make the model scale equivariant (i.e. positively homogeneous), set 
-    #                 <bias>, <batchNorm_final>, <batchNorm_hidden> to False, and use a scale-equivariant activation
+    #                 to make the model scale equivariant (i.e. positively homogeneous) with respect to the vertex features, set 
+    #                 all of <bias>, <batchNorm_final>, <batchNorm_hidden> to False, and use a scale-equivariant activation
     #                 (e.g. ReLU, or the Leaky ReLU used by deafault).
     #                 Default: True
     #
@@ -56,6 +56,11 @@ class SW_conv(MessagePassing):
     #                 Tell whether to apply batch normalization to the outputs of the final and hidden layers.
     #                 The normalization is applied after the linear layer and before the activation.
     #                 Defaults: False
+    #
+    # dropout_final, dropout_hidden:
+    #                 Dropout probabilities 0 <= p < 1 to be used at the final and hidden layers of the MLP.
+    #                 The order of each layer is:  Linear transformation -> Batch normalization -> Activation -> Dropout
+    #                 Defaults: 0
 
     def __init__(self,
                  in_channels, out_channels,
@@ -65,8 +70,8 @@ class SW_conv(MessagePassing):
                  mlp_layers=1, mlp_hidden_dim=None,
                  mlp_activation_final = torch.nn.LeakyReLU(negative_slope=0.2), 
                  mlp_activation_hidden = torch.nn.LeakyReLU(negative_slope=0.2), 
-                 batchNorm_final = False,
-                 batchNorm_hidden = False,
+                 batchNorm_final = False, batchNorm_hidden = False,
+                 dropout_final = 0, dropout_hidden = 0,
                  self_loop_weight = 1,
                  device=None, dtype=torch.float32):
         
@@ -110,6 +115,7 @@ class SW_conv(MessagePassing):
                 out_curr = out_channels if i == mlp_layers-1 else mlp_hidden_dim
                 act_curr = mlp_activation_final if i == mlp_layers-1 else mlp_activation_hidden
                 bn_curr = batchNorm_final if i == mlp_layers-1 else batchNorm_hidden
+                dropout_curr = dropout_final if i == mlp_layers-1 else dropout_hidden
 
                 mlp_modules.append( torch.nn.Linear(in_curr, out_curr, bias=bias, device=device, dtype=dtype) )
 
@@ -118,6 +124,9 @@ class SW_conv(MessagePassing):
 
                 if act_curr is not None:
                     mlp_modules.append( act_curr )
+
+                if dropout_curr > 0:
+                    mlp_modules.append( torch.nn.Dropout(p=dropout_curr) )
                 
             self.mlp = torch.nn.Sequential(*mlp_modules); 
         
