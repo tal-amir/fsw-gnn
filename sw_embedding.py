@@ -122,7 +122,7 @@ class SW_embedding(nn.Module):
         self.learnable_freqs = learnable_freqs
 
         # Note: freqs_init is checked for correctness downstream at generate_embedding_parameters()
-        freqs_init = ifnone(freqs_init, 0 if learnable_freqs else 'random')
+        freqs_init = ifnone(freqs_init, 'random')
         self.freqs_init = freqs_init
 
         self.enable_bias = enable_bias

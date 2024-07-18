@@ -133,7 +133,9 @@ class SW_conv(MessagePassing):
         self.size_coeff = torch.nn.Parameter( torch.ones(1, device=device, dtype=dtype) / np.sqrt(embed_dim-1), requires_grad=learnable_embedding)
 
         self.sw_embed = SW_embedding(d=in_channels, m=embed_dim-1, learnable_slices=learnable_embedding,
-                                     learnable_freqs=learnable_embedding, minimize_slice_coherence=True, enable_bias=embed_bias,
+                                     learnable_freqs=learnable_embedding, 
+                                     minimize_slice_coherence=True, freqs_init='spread',
+                                     enable_bias=embed_bias,
                                      device=device, dtype=dtype)
 
         device = device if device is not None else self.sw_embed.get_device()
