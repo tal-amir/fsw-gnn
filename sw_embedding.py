@@ -807,13 +807,13 @@ class SW_embedding(nn.Module):
 
 # Used for verify assertions only in debug mode.
 def assert_debug(condition, message):
-    debug = False # Set this to True to verify the input assertions
+    debug = True # Set this to True to verify the input assertions
 
     if debug:
         assert condition, message
 
 def assert_coalesced(A):
-    debug = False
+    debug = True
     if debug:
         assert A.is_coalesced(), 'tensor is not coalesced'
 
@@ -1021,7 +1021,9 @@ class ag:
             if ctx.needs_input_grad[0]:
                 # The to_sparse() below is just to make sure that B, which is dense, doesn't get broadcast
                 # to the size of grad_output; it is the same size of A, which can be huge.
+                assert_coalesced(grad_output)
                 out_A = B * grad_output.to_sparse()
+                #TODO: Instead, create out_A manually and use the fact that grad_output is coalesced (Hopefully)
             
             if ctx.needs_input_grad[1]:
                 # B is dense, so the gradient with respect to B should also be dense.
@@ -1351,7 +1353,7 @@ class sp:
     # If the command sp.verify_coalescence(out) is not commented, the tensor is verified for being correctly coalesced.
     def sparse_coo_tensor_coalesced(indices, values, size):
         out = torch.sparse_coo_tensor(indices=indices, values=values, size=size, is_coalesced=True)
-        debug = False
+        debug = True
 
         if debug:
             sp.verify_coalescence(out)
@@ -1394,7 +1396,7 @@ class sp:
 
         inds1d = sp.ravel_index(indices, shape)
         
-        debug = False
+        debug = True
         if debug:
             assert ( len(torch.unique(inds1d)) == len(inds1d) ), 'indices are not unique'
 
