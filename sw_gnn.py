@@ -162,20 +162,25 @@ class SW_conv(MessagePassing):
         # vertex_degrees = degree(col, n, dtype=vertex_features.dtype).unsqueeze(-1)
 
         # Convert edge_index to sparse adjacency matrix
-        adj = pyg.utils.to_torch_coo_tensor(edge_index, edge_attr=None, size=n, is_coalesced=False)
-        adj = adj.to(vertex_features.dtype)
-        adj.requires_grad_(False)
-
-        # Add weighted self-loops
-        if self.self_loop_weight > 0:
-            indices = torch.arange(n, dtype=torch.long, device=vertex_features.device).unsqueeze(0).expand(2, -1)
-            values = torch.full((n,), self.self_loop_weight, dtype=vertex_features.dtype, device=vertex_features.device)
-            adj += torch.sparse_coo_tensor(indices, values, (n, n))
-            adj.coalesce()
-            in_degrees = torch.sum(adj, dim=-1, keepdim=True).to_dense()
+        if True:
+            adj = SW_conv.edge_index_to_adj(edge_index, num_vertices=n, dtype=vertex_features.dtype, self_loop_weight=self.self_loop_weight)
+            
         else:
-            adj.coalesce()
+            adj = pyg.utils.to_torch_coo_tensor(edge_index, edge_attr=None, size=n, is_coalesced=False)
+            adj = adj.to(vertex_features.dtype)
+            adj.requires_grad_(False)
 
+            # Add weighted self-loops
+            if self.self_loop_weight > 0:
+                indices = torch.arange(n, dtype=torch.long, device=vertex_features.device).unsqueeze(0).expand(2, -1)
+                values = torch.full((n,), self.self_loop_weight, dtype=vertex_features.dtype, device=vertex_features.device)
+                adj += torch.sparse_coo_tensor(indices, values, (n, n))
+                adj.coalesce()                
+            else:
+                adj.coalesce()
+
+        in_degrees = torch.sum(adj, dim=-1, keepdim=True).to_dense()
+        
         # Aggregate neighboring vertex features
         emb = self.sw_embed(X=vertex_features, W=adj, graph_mode=True, serialize_num_slices=None)
 
@@ -203,4 +208,24 @@ class SW_conv(MessagePassing):
 
     def update(self):
         pass
+
+
+    def edge_index_to_adj(edge_index, num_vertices, dtype, self_loop_weight=0):
+        num_edges = edge_index.shape[1]
+
+        inds = edge_index
+        vals = torch.ones(num_edges, device=edge_index.device, dtype=dtype)
+
+        if self_loop_weight > 0:
+            inds2 = torch.arange(num_vertices, device=edge_index.device).reshape([1, num_vertices]).repeat(2,1)
+            vals2 = self_loop_weight*torch.ones(num_vertices, device=edge_index.device, dtype=dtype)
+
+            inds = torch.cat( (inds, inds2), dim=1 )
+            vals = torch.cat( (vals, vals2), dim=0 )
+
+        adj = torch.sparse_coo_tensor(indices=inds, values=vals)            
+        adj = adj.coalesce()
+
+        return adj
+        
 

@@ -4,17 +4,18 @@
 # Technion Institute of Technology
 # Haifa, Israel
 
-version = '1.25'
-version_date = '2024-07-21'
+version = '1.25b'
+version_date = '2024-07-22'
 
 # Changelog:
-# 1.25 Removed most of coalesce() calls that follow calls to torch.sparse_coo_tensor()
-# 1.24 Removed attributes 'device' and 'dtype' from SW_embedding due to lack of safety. Use get_device(), get_dtype() instead.
-# 1.23 Added project_W()
-# 1.22 Added support for biases
-#      learnable_freqs=True now initializes frequencies to zero
-# 1.21 Added reset_parameters()
-#      Added type hinting and enforcement
+# 1.25b  Got rid of some more coalesce()
+# 1.25   Removed most of coalesce() calls that follow calls to torch.sparse_coo_tensor()
+# 1.24   Removed attributes 'device' and 'dtype' from SW_embedding due to lack of safety. Use get_device(), get_dtype() instead.
+# 1.23   Added project_W()
+# 1.22   Added support for biases
+#        learnable_freqs=True now initializes frequencies to zero
+# 1.21   Added reset_parameters()
+#        Added type hinting and enforcement
 
 
 import numpy as np
@@ -691,18 +692,11 @@ class SW_embedding(nn.Module):
                 arg2 = np.pi * freqs * (2*Wps_sum - Wps)
                 del Wps_sum
                 assert_coalesced(arg2)
-            elif variant == 2:                
-                arg2 = Wps_sum
-                assert_coalesced(arg2)
-                del Wps_sum
-                arg2 *= 2
-                #assert_coalesced(arg2)
-                arg2 = arg2.coalesce()
-                
-                assert_debug( (arg2.indices()==Wps.indices()).all(), '' )
+            elif variant == 2:                               
+                #assert_debug( (arg2.indices()==Wps.indices()).all(), '' )
 
-                # The three commands below are just a more economic way to do: arg2 -= Wps
-                arg2 = sp.sparse_coo_tensor_coalesced(indices=arg2.indices(), values=arg2.values()-Wps.values(), size=arg2.shape)
+                # The command below is a more economic way of doing: arg2 = 2*Wps_sum - Wps
+                arg2 = sp.sparse_coo_tensor_coalesced(indices=Wps.indices(), values=2*Wps_sum.values()-Wps.values(), size=Wps.shape)
                 arg2 = ag.mul_sparse_dense.apply(arg2, np.pi*freqs)
                 arg2 = arg2.coalesce()
             else:
