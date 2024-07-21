@@ -808,13 +808,13 @@ class SW_embedding(nn.Module):
 
 # Used for verify assertions only in debug mode.
 def assert_debug(condition, message):
-    debug = True # Set this to True to verify the input assertions
+    debug = False # Set this to True to verify the input assertions
 
     if debug:
         assert condition, message
 
 def assert_coalesced(A):
-    debug = True
+    debug = False
     if debug:
         assert A.is_coalesced(), 'tensor is not coalesced'
 
@@ -1380,7 +1380,7 @@ class sp:
     # If the command sp.verify_coalescence(out) is not commented, the tensor is verified for being correctly coalesced.
     def sparse_coo_tensor_coalesced(indices, values, size):
         out = torch.sparse_coo_tensor(indices=indices, values=values, size=size, is_coalesced=True)
-        debug = True
+        debug = False
 
         if debug:
             sp.verify_coalescence(out)
@@ -1423,7 +1423,7 @@ class sp:
 
         inds1d = sp.ravel_index(indices, shape)
         
-        debug = True
+        debug = False
         if debug:
             assert ( len(torch.unique(inds1d)) == len(inds1d) ), 'indices are not unique'
 
