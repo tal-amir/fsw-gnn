@@ -4,10 +4,11 @@
 # Technion Institute of Technology
 # Haifa, Israel
 
-version = '1.25b'
+version = '1.25c'
 version_date = '2024-07-22'
 
 # Changelog:
+# 1.25c  Got rid of some more coalesce()
 # 1.25b  Got rid of some more coalesce()
 # 1.25   Removed most of coalesce() calls that follow calls to torch.sparse_coo_tensor()
 # 1.24   Removed attributes 'device' and 'dtype' from SW_embedding due to lack of safety. Use get_device(), get_dtype() instead.
@@ -927,7 +928,24 @@ class ag:
             ctx.dim = dim if dim >= 0 else ( dim + A.dim() + 1 )
             ctx.input_shape = A.shape
 
-            return A.unsqueeze(dim=dim)
+            variant = 2
+
+            if variant == 1:
+                return A.unsqueeze(dim=dim)
+            
+            elif variant == 2:
+                assert_coalesced(A)
+
+                vals = A.values()
+                
+                inds = A.indices()
+                inds = torch.cat( (inds[0:ctx.dim,:], torch.zeros((1,inds.shape[1]), device=inds.device, dtype=inds.dtype), inds[ctx.dim:,:]), dim=0 )
+
+                output_shape = ctx.input_shape[0:ctx.dim] + (1,) + ctx.input_shape[ctx.dim:]
+
+                return sp.sparse_coo_tensor_coalesced(indices=inds, values=vals, size=output_shape)
+
+
 
         @staticmethod
         @once_differentiable
@@ -1021,9 +1039,18 @@ class ag:
             if ctx.needs_input_grad[0]:
                 # The to_sparse() below is just to make sure that B, which is dense, doesn't get broadcast
                 # to the size of grad_output; it is the same size of A, which can be huge.
-                assert_coalesced(grad_output)
-                out_A = B * grad_output.to_sparse()
-                #TODO: Instead, create out_A manually and use the fact that grad_output is coalesced (Hopefully)
+
+                if True:
+                    out_A = B * grad_output.to_sparse()                    
+                else:
+                    # TODO: Implement this more efficient method. There is a problem with dims due to broadcasting
+                    assert_coalesced(grad_output)
+                    inds = grad_output.indices()
+                    #inds[ctx.broadcast_dims, :] = 0
+                    vals = grad_output.values().clone()
+                    vals *= B[tuple(inds)]
+                    out_A = sp.sparse_coo_tensor_coalesced(indices=inds, values=vals, size=grad_output.shape)
+                    
             
             if ctx.needs_input_grad[1]:
                 # B is dense, so the gradient with respect to B should also be dense.
@@ -1037,7 +1064,7 @@ class ag:
                     
                     out_B = out_B.to_dense()
                 else:
-                    # Note that if B didn't need to br broadcast, this size is not huge
+                    # Note that if B didn't need to be broadcast, this size is not huge
                     out_B = (A*grad_output).to_dense()
 
             return out_A, out_B
@@ -1108,8 +1135,8 @@ class ag:
             assert A.is_sparse and B.is_sparse
             assert (A.shape == B.shape), 'A and B must have the same shape'
             
-            A = A.coalesce()
-            B = B.coalesce()
+            assert_coalesced(A)
+            assert_coalesced(B)
 
             assert (A.indices() == B.indices()).all(), 'A and B nonzero indices do not match'
 
@@ -1262,9 +1289,9 @@ class ag:
             dim = ctx.dim
 
             if ctx.needs_input_grad[0]:
-                G = sp.sparse_flip(grad_output.coalesce(), dim=dim)
+                G = sp.sparse_flip(grad_output, dim=dim)
                 G = sp.sparse_cumsum(G, dim=dim)
-                grad_input = sp.sparse_flip(G, dim=dim).coalesce()
+                grad_input = sp.sparse_flip(G, dim=dim)
             else:
                 grad_input = None
 
