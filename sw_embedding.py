@@ -8,6 +8,7 @@ version = '1.25'
 version_date = '2024-07-21'
 
 # Changelog:
+# 1.25 Removed most of coalesce() calls that follow calls to torch.sparse_coo_tensor()
 # 1.24 Removed attributes 'device' and 'dtype' from SW_embedding due to lack of safety. Use get_device(), get_dtype() instead.
 # 1.23 Added project_W()
 # 1.22 Added support for biases
@@ -25,6 +26,8 @@ from torch.autograd.function import once_differentiable
 import warnings
 import numbers
 import type_enforced
+
+
 
 
 ''' Maps multisets in R^d to vectors in R^m using the Sliced-Wasserstrin Embedding.
@@ -467,7 +470,7 @@ class SW_embedding(nn.Module):
             if W.is_sparse or W.layout != torch.strided:
                 assert W.layout == torch.sparse_coo, ( "Sparse W has an unsupported sparsity layout '%s'. Only the COO layout (torch.sparse_coo) is currently supported." % (W.layout) )
 
-                W = W.coalesce()
+                assert W.is_coalesced(), 'Sparse W must be coalesced'
                 W_vals = W.values()
             else:
                 W_vals = W
@@ -687,11 +690,13 @@ class SW_embedding(nn.Module):
             if variant == 1:
                 arg2 = np.pi * freqs * (2*Wps_sum - Wps)
                 del Wps_sum
-                arg2 = arg2.coalesce()
-            elif variant == 2:
+                assert_coalesced(arg2)
+            elif variant == 2:                
                 arg2 = Wps_sum
+                assert_coalesced(arg2)
                 del Wps_sum
                 arg2 *= 2
+                #assert_coalesced(arg2)
                 arg2 = arg2.coalesce()
                 
                 assert_debug( (arg2.indices()==Wps.indices()).all(), '' )
@@ -750,7 +755,7 @@ class SW_embedding(nn.Module):
             if W.is_sparse or W.layout != torch.strided:
                 assert W.layout == torch.sparse_coo, ( "Sparse W has an unsupported sparsity layout '%s'. Only the COO layout (torch.sparse_coo) is currently supported." % (W.layout) )
 
-                W = W.coalesce()
+                assert W.is_coalesced(), 'Sparse W must be coalesced'
                 inds = W.indices()
                 vals = W.values()
 
@@ -812,6 +817,11 @@ def assert_debug(condition, message):
 
     if debug:
         assert condition, message
+
+def assert_coalesced(A):
+    debug = False
+    if debug:
+        assert A.is_coalesced(), 'tensor is not coalesced'
 
 # Computes a finite difference with zero padding
 def diff_zeropad(input, dim):
@@ -1305,9 +1315,10 @@ class ag:
 
                 del A
 
-                # Indices are not coalesced
-                out = torch.sparse_coo_tensor(indices=inds, values=vals, size=out_shape).coalesce()
+                inds2, vals2 = sp.sort_inds_vals(inds, vals, out_shape, ensure_unique=True)
                 del inds, vals
+
+                out = sp.sparse_coo_tensor_coalesced(indices=inds2, values=vals2, size=out_shape)
 
                 return out
 
@@ -1353,12 +1364,51 @@ class sp:
 
         return out   
 
+
     # Verify that a sparse input tensor A is correctly coalesced.
     def verify_coalescence(A):
         assert A.is_coalesced(), 'verify_coalescence: input tensor is not coalesced'
         B = torch.sparse_coo_tensor(indices=A.indices(), values=A.values(), size=A.shape).coalesce()
         assert (B.indices() == A.indices()).all(), 'verify_coalescence: index mismatch in input'
         assert (B.values() == A.values()).all(), 'verify_coalescence: value mismatch in input'
+
+
+    # The inverse of torch.unravel_index()
+    def ravel_index(indices, shape):
+        assert indices.dim() == 2, 'indices must be a 2-dimensional tensor'
+        nd = indices.shape[0]
+
+        weights = shape.reshape([nd,1]).flip(dims=(0,))[0:-1].cumprod(dim=0).flip(dims=(0,))
+        weights = torch.cat((weights, torch.ones(size=(1,1), device=weights.device, dtype=weights.dtype)), dim=0)
+
+        out = torch.sum(indices*weights, dim=0) 
+        return out
+
+
+    # Sort indices and values. Similar to coalesce(), but does not assume nor impose uniqueness.
+    def sort_inds_vals(indices, values, shape=None, ensure_unique=False):
+
+        if shape is None:
+            shape, _ = torch.max(indices, dim=1)
+            shape += 1
+        elif isinstance(shape, (tuple,list,torch.Size)):
+            shape = torch.tensor(shape, device=indices.device, dtype=indices.dtype)
+        elif isinstance(shape, torch.Tensor):
+            pass
+        else:
+            raise RuntimeError('sort_inds_vals: invalid shape data type')
+
+        inds1d = sp.ravel_index(indices, shape)
+        
+        debug = False
+        if debug:
+            assert ( len(torch.unique(inds1d)) == len(inds1d) ), 'indices are not unique'
+
+        _, sort_perm = torch.sort(inds1d)
+        del inds1d
+
+        return (indices[:,sort_perm], values[sort_perm])
+
 
     # Entrywise division of sparse A by dense A. Supports broadcasting of B to A.
     def div_sparse_dense(A,B):
@@ -1426,10 +1476,12 @@ class sp:
             sums_shape = list(A.shape)
             sums_shape = sums_shape[0:-1]
             sums_shape = tuple(sums_shape)
-            # Indices are not coalesced
+
+            # Indices are not coalesced            
             sums = torch.sparse_coo_tensor(indices=A.indices()[0:-1, :], values=A.values(), size=sums_shape)
             sums = sums.coalesce()
             # sums = A.sum(dim=-1)
+            
             sums = sums.unsqueeze(-1)
             sums = sums.coalesce()
         
@@ -1463,10 +1515,10 @@ class sp:
             walled_shape = tuple(walled_shape)
 
             # Indices are not coalesced
-            A_walled = torch.sparse_coo_tensor(indices=inds_walled, values=vals_walled, size=walled_shape)
+            inds2, vals2 = sp.sort_inds_vals(inds_walled, vals_walled, shape=walled_shape, ensure_unique=True)
             del A, inds_walled, vals_walled
-
-            A_walled = A_walled.coalesce()
+            A_walled = sp.sparse_coo_tensor_coalesced(indices=inds2, values=vals2, size=walled_shape)
+            del inds2, vals2
 
         else:
             raise RuntimeError('This should not happen')
@@ -1496,8 +1548,9 @@ class sp:
 
         inds[dim, :] = A.shape[dim] - inds[dim, :] - 1
 
-        # Indices are not coalesced
-        out = torch.sparse_coo_tensor(indices=inds, values=vals, size=A.shape).coalesce()
+        inds2, vals2 = sp.sort_inds_vals(inds, vals, shape=A.shape, ensure_unique=True)
+        out = sp.sparse_coo_tensor_coalesced(indices=inds2, values=vals2, size=A.shape)
+
         return out
 
 
@@ -1534,11 +1587,11 @@ class sp:
 
         inds[dim,:] = perm_invs[tuple(perm_inds)]
 
-        # Indices are not coalesced
-        out = torch.sparse_coo_tensor(indices=inds, values=A.values().clone(), size=A.shape)
+        inds2, vals2 = sp.sort_inds_vals(inds, A.values().clone(), shape=A.shape, ensure_unique=True)
         del inds, perm_inds, perms, perm_invs
 
-        out = out.coalesce()
+        out = sp.sparse_coo_tensor_coalesced(indices=inds2, values=vals2, size=A.shape)
+
         return out
 
 
