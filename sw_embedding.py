@@ -4,8 +4,8 @@
 # Technion Institute of Technology
 # Haifa, Israel
 
-version = '1.24'
-version_date = '2024-07-17'
+version = '1.25'
+version_date = '2024-07-21'
 
 # Changelog:
 # 1.24 Removed attributes 'device' and 'dtype' from SW_embedding due to lack of safety. Use get_device(), get_dtype() instead.
@@ -82,7 +82,7 @@ class SW_embedding(nn.Module):
                  d : int, m : int | None = None,
                  nSlices : int | None = None, nFreqs : int | None = None, collapse_freqs : bool = False,
                  learnable_slices : bool = False, learnable_freqs : bool = False,
-                 freqs_init : float | int | str | tuple[float,float] | None = None,
+                 freqs_init : float | int | str | tuple[float,float] = 'random',
                  minimize_slice_coherence : bool = False,
                  enable_bias : bool = True,
                  device : torch.device | int | str | None = None, dtype : torch.dtype = torch.float32, 
@@ -122,7 +122,6 @@ class SW_embedding(nn.Module):
         self.learnable_freqs = learnable_freqs
 
         # Note: freqs_init is checked for correctness downstream at generate_embedding_parameters()
-        freqs_init = ifnone(freqs_init, 'random')
         self.freqs_init = freqs_init
 
         self.enable_bias = enable_bias
@@ -695,14 +694,11 @@ class SW_embedding(nn.Module):
                 arg2 *= 2
                 arg2 = arg2.coalesce()
                 
+                assert_debug( (arg2.indices()==Wps.indices()).all(), '' )
+
                 # The three commands below are just a more economic way to do: arg2 -= Wps
-                assert (arg2.indices()==Wps.indices()).all()
-                arg2 = torch.sparse_coo_tensor(indices=arg2.indices(), values=arg2.values()-Wps.values(), size=arg2.shape)
-                arg2 = arg2.coalesce()
-
-                arg2 = arg2.coalesce()
+                arg2 = sp.sparse_coo_tensor_coalesced(indices=arg2.indices(), values=arg2.values()-Wps.values(), size=arg2.shape)
                 arg2 = ag.mul_sparse_dense.apply(arg2, np.pi*freqs)
-
                 arg2 = arg2.coalesce()
             else:
                 raise RuntimeError('This should not happen')
@@ -763,8 +759,7 @@ class SW_embedding(nn.Module):
 
                 vals = torch.clamp(vals, min=eps)
 
-                W = torch.sparse_coo_tensor(indices=inds, values=vals, size=W.shape)
-                W = W.coalesce()
+                W = sp.sparse_coo_tensor_coalesced(indices=inds, values=vals, size=W.shape)
                 
                 W_sum = ag.sum_sparseToDense.apply(W, -1)
 
@@ -811,7 +806,12 @@ class SW_embedding(nn.Module):
 ##                                                  Tools                                                  ##
 #############################################################################################################
 
+# Used for verify assertions only in debug mode.
+def assert_debug(condition, message):
+    debug = True # Set this to True to verify the input assertions
 
+    if debug:
+        assert condition, message
 
 # Computes a finite difference with zero padding
 def diff_zeropad(input, dim):
@@ -937,8 +937,8 @@ class ag:
             inds = torch.index_select(grad_output.indices(), 0, input_dims_in_output)
             vals = grad_output.values()
 
-            grad_input = torch.sparse_coo_tensor(indices=inds, values=vals, size=input_shape).coalesce()
-
+            grad_input = sp.sparse_coo_tensor_coalesced(indices=inds, values=vals, size=input_shape)
+            
             # Note: If there was a torch.squeeze() for sparse tensors, we could have done this in one line.
 
             return grad_input, None
@@ -974,7 +974,7 @@ class ag:
                 
                 vals = grad_output[tuple(inds_out)]
 
-                grad_input = torch.sparse_coo_tensor(indices=A.indices(), values=vals, size=A.shape).coalesce()
+                grad_input = sp.sparse_coo_tensor_coalesced(indices=A.indices(), values=vals, size=A.shape)
 
             return grad_input, None
 
@@ -996,7 +996,7 @@ class ag:
             
             vals = A.values() * B[tuple(inds)]
 
-            out = torch.sparse_coo_tensor(indices=A.indices(), values=vals, size=A.shape).coalesce()
+            out = sp.sparse_coo_tensor_coalesced(indices=A.indices(), values=vals, size=A.shape)
 
             A_save = A if ctx.needs_input_grad[1] else None
             B_save = B if ctx.needs_input_grad[0] else None
@@ -1054,7 +1054,7 @@ class ag:
             
             vals = A.values() / B[tuple(inds)]
 
-            out = torch.sparse_coo_tensor(indices=A.indices(), values=vals, size=A.shape).coalesce()
+            out = sp.sparse_coo_tensor_coalesced(indices=A.indices(), values=vals, size=A.shape)
 
             A_save = A if ctx.needs_input_grad[1] else None
             B_save = B if True in ctx.needs_input_grad else None
@@ -1121,7 +1121,7 @@ class ag:
             ctx.shape = A.shape
             ctx.inds = inds
 
-            return torch.sparse_coo_tensor(indices=inds, values=out_vals, size=A.shape).coalesce()
+            return sp.sparse_coo_tensor_coalesced(indices=inds, values=out_vals, size=A.shape)
 
         @staticmethod
         @once_differentiable
@@ -1133,10 +1133,10 @@ class ag:
             out_A = out_B = None
 
             if ctx.needs_input_grad[0]:
-                out_A = torch.sparse_coo_tensor(indices=inds, values=B_vals, size=shape) * grad_output
+                out_A = sp.sparse_coo_tensor_coalesced(indices=inds, values=B_vals, size=shape) * grad_output
 
             if ctx.needs_input_grad[1]:
-                out_B = torch.sparse_coo_tensor(indices=inds, values=A_vals, size=shape) * grad_output
+                out_B = sp.sparse_coo_tensor_coalesced(indices=inds, values=A_vals, size=shape) * grad_output
 
             return out_A, out_B
 
@@ -1170,7 +1170,7 @@ class ag:
             ctx.shape = A.shape
             ctx.inds = inds
 
-            return torch.sparse_coo_tensor(indices=inds, values=out_vals, size=A.shape).coalesce()
+            return sp.sparse_coo_tensor_coalesced(indices=inds, values=out_vals, size=A.shape)
 
         @staticmethod
         @once_differentiable
@@ -1183,15 +1183,13 @@ class ag:
 
             if ctx.needs_input_grad[0]:
                 out_vals_A = sp.dsinc(A_vals) * torch.cos(B_vals)
-                out_A = torch.sparse_coo_tensor(indices=inds, values=out_vals_A, size=shape) * grad_output
+                out_A = sp.sparse_coo_tensor_coalesced(indices=inds, values=out_vals_A, size=shape) * grad_output
                 del out_vals_A
-                out_A = out_A.coalesce()
 
             if ctx.needs_input_grad[1]:
                 out_vals_B = torch.sinc(A_vals) * (-torch.sin(B_vals))
-                out_B = torch.sparse_coo_tensor(indices=inds, values=out_vals_B, size=shape) * grad_output
+                out_B = sp.sparse_coo_tensor_coalesced(indices=inds, values=out_vals_B, size=shape) * grad_output
                 del out_vals_B
-                out_B = out_B.coalesce()
 
             return out_A, out_B
 
@@ -1237,7 +1235,7 @@ class ag:
                 grad_output = grad_output.coalesce()
                 inds = grad_output.indices().clone()
                 inds[ctx.dim,:] = Xi_inv[tuple(inds)]
-                grad_input = torch.sparse_coo_tensor(indices=inds, values=grad_output.values(), size=grad_output.shape).coalesce()
+                grad_input = sp.sparse_coo_tensor_coalesced(indices=inds, values=grad_output.values(), size=grad_output.shape)
             else:
                 grad_input = torch.gather(grad_output, dim=ctx.dim, index=Xi_inv)
 
@@ -1307,10 +1305,9 @@ class ag:
 
                 del A
 
-                out = torch.sparse_coo_tensor(indices=inds, values=vals, size=out_shape)
+                # Coalesce problem
+                out = torch.sparse_coo_tensor(indices=inds, values=vals, size=out_shape).coalesce()
                 del inds, vals
-
-                out = out.coalesce()
 
                 return out
 
@@ -1330,6 +1327,7 @@ class ag:
                 inds = grad_output.indices().clone()
                 inds[ctx.dim] = torch.remainder(inds[ctx.dim], ctx.shape[ctx.dim])
 
+                # Coalesce problem
                 grad_input = torch.sparse_coo_tensor(indices=inds, values=grad_output.values(), size=ctx.shape).coalesce()
             else:
                 grad_input = None
@@ -1344,6 +1342,24 @@ class ag:
 #############################################################################################################
 
 class sp:
+    # Create a COO sparse tensor in a coalesced state, assuming that the input indices are already coalesced.
+    # If the command sp.verify_coalescence(out) is not commented, the tensor is verified for being correctly coalesced.
+    def sparse_coo_tensor_coalesced(indices, values, size):
+        out = torch.sparse_coo_tensor(indices=indices, values=values, size=size, is_coalesced=True)
+        debug = True
+
+        if debug:
+            sp.verify_coalescence(out)
+
+        return out   
+
+    # Verify that a sparse input tensor A is correctly coalesced.
+    def verify_coalescence(A):
+        assert A.is_coalesced(), 'verify_coalescence: input tensor is not coalesced'
+        B = torch.sparse_coo_tensor(indices=A.indices(), values=A.values(), size=A.shape).coalesce()
+        assert (B.indices() == A.indices()).all(), 'verify_coalescence: index mismatch in input'
+        assert (B.values() == A.values()).all(), 'verify_coalescence: value mismatch in input'
+
     # Entrywise division of sparse A by dense A. Supports broadcasting of B to A.
     def div_sparse_dense(A,B):
         assert A.is_sparse, 'A must be sparse'
@@ -1359,7 +1375,7 @@ class sp:
 
         out_vals = A_vals / B[tuple(inds)]
 
-        return torch.sparse_coo_tensor(indices=inds, values=out_vals, size=A.shape).coalesce()
+        return sp.sparse_coo_tensor_coalesced(indices=inds, values=out_vals, size=A.shape)
 
     def sparse_cumsum(A, dim):
         assert A.is_sparse, 'A must be sparse'
@@ -1410,6 +1426,7 @@ class sp:
             sums_shape = list(A.shape)
             sums_shape = sums_shape[0:-1]
             sums_shape = tuple(sums_shape)
+            # Coalesce problem
             sums = torch.sparse_coo_tensor(indices=A.indices()[0:-1, :], values=A.values(), size=sums_shape)
             sums = sums.coalesce()
             # sums = A.sum(dim=-1)
@@ -1445,6 +1462,7 @@ class sp:
             walled_shape[-1] = walled_shape[-1]+1
             walled_shape = tuple(walled_shape)
 
+            # Coalesce problem
             A_walled = torch.sparse_coo_tensor(indices=inds_walled, values=vals_walled, size=walled_shape)
             del A, inds_walled, vals_walled
 
@@ -1459,7 +1477,7 @@ class sp:
 
         subset = (inds[-1,:] < A_shape[-1])
 
-        out = torch.sparse_coo_tensor(indices=inds[:,subset], values=vals[subset], size=A_shape)
+        out = sp.sparse_coo_tensor_coalesced(indices=inds[:,subset], values=vals[subset], size=A_shape)
         del inds, vals, subset
 
         out = out.to(dtype=orig_dtype)
@@ -1478,6 +1496,7 @@ class sp:
 
         inds[dim, :] = A.shape[dim] - inds[dim, :] - 1
 
+        # Coalesce problem
         out = torch.sparse_coo_tensor(indices=inds, values=vals, size=A.shape).coalesce()
         return out
 
@@ -1515,6 +1534,7 @@ class sp:
 
         inds[dim,:] = perm_invs[tuple(perm_inds)]
 
+        # Coalesce problem
         out = torch.sparse_coo_tensor(indices=inds, values=A.values().clone(), size=A.shape)
         del inds, perm_inds, perms, perm_invs
 
@@ -1550,7 +1570,7 @@ class sp_old:
 
         vals = vals * factors[inds[dim,:]]
 
-        return torch.sparse_coo_tensor(indices=inds, values=vals, size=A.shape).coalesce()
+        return sp.sparse_coo_tensor_coalesced(indices=inds, values=vals, size=A.shape)
 
 
 
@@ -1572,7 +1592,7 @@ class sp_old:
 
         inds[-1,:] = inds[-1,:] - 1
 
-        return torch.sparse_coo_tensor(indices=inds[:,subset], values=vals[subset], size=B.shape).coalesce()
+        return sp.sparse_coo_tensor_coalesced(indices=inds[:,subset], values=vals[subset], size=B.shape)
 
 
     def sparse_dense_mul(A,B):
@@ -1588,7 +1608,7 @@ class sp_old:
         out_vals = A_vals * B[tuple(A_inds)]
         requires_grad = A.requires_grad or B.requires_grad
 
-        return torch.sparse_coo_tensor(indices=A_inds, values=out_vals, size=A.shape, requires_grad=requires_grad).coalesce()
+        return sp.sparse_coo_tensor_coalesced(indices=A_inds, values=out_vals, size=A.shape, requires_grad=requires_grad)
 
 
     def sparse_mul(A,B):
@@ -1606,7 +1626,7 @@ class sp_old:
 
         out_vals = A_vals * B_vals
 
-        return torch.sparse_coo_tensor(indices=A_inds, values=out_vals, size=A.shape).coalesce()
+        return sp.sparse_coo_tensor_coalesced(indices=A_inds, values=out_vals, size=A.shape)
 
 
     def sparse_div(A,B):
@@ -1624,7 +1644,7 @@ class sp_old:
 
         out_vals = A_vals / B_vals
 
-        return torch.sparse_coo_tensor(indices=A_inds, values=out_vals, size=A.shape).coalesce()
+        return sp.sparse_coo_tensor_coalesced(indices=A_inds, values=out_vals, size=A.shape)
 
 
     def sparse_mul_expand(A, B):
@@ -1660,7 +1680,7 @@ class sp_old:
 
     def sparse_sinc(A):
         A = A.coalesce()
-        return torch.sparse_coo_tensor(indices=A.indices(), values=torch.sinc(A.values()), size=A.shape)
+        return sp.sparse_coo_tensor_coalesced(indices=A.indices(), values=torch.sinc(A.values()), size=A.shape)
 
 
     def sparse_sinc_cos(A,B):
@@ -1676,7 +1696,7 @@ class sp_old:
 
         out_vals = torch.sinc(A_vals)*torch.cos(B_vals)
 
-        return torch.sparse_coo_tensor(indices=A_inds, values=out_vals, size=A.shape)
+        return sp.sparse_coo_tensor_coalesced(indices=A_inds, values=out_vals, size=A.shape)
 
 
     def sparse_sinc_A_cos_B_minus_C(A,B,C):
@@ -1695,7 +1715,7 @@ class sp_old:
 
         out_vals = torch.sinc(A_vals) * ( torch.cos(B_vals)*torch.cos(C_vals) + torch.sin(B_vals)*torch.sin(C_vals) )
 
-        return torch.sparse_coo_tensor(indices=A_inds, values=out_vals, size=A.shape)
+        return sp.sparse_coo_tensor_coalesced(indices=A_inds, values=out_vals, size=A.shape)
 
 
 
