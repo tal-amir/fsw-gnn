@@ -808,7 +808,7 @@ class SW_embedding(nn.Module):
 
 # Used for verify assertions only in debug mode.
 def assert_debug(condition, message):
-    debug = True # Set this to True to verify the input assertions
+    debug = False # Set this to True to verify the input assertions
 
     if debug:
         assert condition, message
@@ -1305,7 +1305,7 @@ class ag:
 
                 del A
 
-                # Coalesce problem
+                # Indices are not coalesced
                 out = torch.sparse_coo_tensor(indices=inds, values=vals, size=out_shape).coalesce()
                 del inds, vals
 
@@ -1327,7 +1327,7 @@ class ag:
                 inds = grad_output.indices().clone()
                 inds[ctx.dim] = torch.remainder(inds[ctx.dim], ctx.shape[ctx.dim])
 
-                # Coalesce problem
+                # Indices are not coalesced
                 grad_input = torch.sparse_coo_tensor(indices=inds, values=grad_output.values(), size=ctx.shape).coalesce()
             else:
                 grad_input = None
@@ -1346,7 +1346,7 @@ class sp:
     # If the command sp.verify_coalescence(out) is not commented, the tensor is verified for being correctly coalesced.
     def sparse_coo_tensor_coalesced(indices, values, size):
         out = torch.sparse_coo_tensor(indices=indices, values=values, size=size, is_coalesced=True)
-        debug = True
+        debug = False
 
         if debug:
             sp.verify_coalescence(out)
@@ -1426,7 +1426,7 @@ class sp:
             sums_shape = list(A.shape)
             sums_shape = sums_shape[0:-1]
             sums_shape = tuple(sums_shape)
-            # Coalesce problem
+            # Indices are not coalesced
             sums = torch.sparse_coo_tensor(indices=A.indices()[0:-1, :], values=A.values(), size=sums_shape)
             sums = sums.coalesce()
             # sums = A.sum(dim=-1)
@@ -1462,7 +1462,7 @@ class sp:
             walled_shape[-1] = walled_shape[-1]+1
             walled_shape = tuple(walled_shape)
 
-            # Coalesce problem
+            # Indices are not coalesced
             A_walled = torch.sparse_coo_tensor(indices=inds_walled, values=vals_walled, size=walled_shape)
             del A, inds_walled, vals_walled
 
@@ -1496,7 +1496,7 @@ class sp:
 
         inds[dim, :] = A.shape[dim] - inds[dim, :] - 1
 
-        # Coalesce problem
+        # Indices are not coalesced
         out = torch.sparse_coo_tensor(indices=inds, values=vals, size=A.shape).coalesce()
         return out
 
@@ -1534,7 +1534,7 @@ class sp:
 
         inds[dim,:] = perm_invs[tuple(perm_inds)]
 
-        # Coalesce problem
+        # Indices are not coalesced
         out = torch.sparse_coo_tensor(indices=inds, values=A.values().clone(), size=A.shape)
         del inds, perm_inds, perms, perm_invs
 
