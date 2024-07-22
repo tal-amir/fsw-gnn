@@ -4,7 +4,7 @@
 # Technion Institute of Technology
 # Haifa, Israel
 
-version = '1.27'
+version = '1.28'
 version_date = '2024-07-22'
 
 # Changelog:
@@ -29,11 +29,11 @@ from torch.autograd.function import once_differentiable
 
 import warnings
 import numbers
-import type_enforced # Important: A runtime error in this line implies that that some function below is given an arguemnt of the wrong type
+import type_enforced # A runtime error in this line implies that that some function below is given an input arguemnt of the wrong type
 
 # Turn this on to run some verifications and sanity checks during runtime.
 # If an error is encountered, a runtime error is raised
-sw_embedding_debug_mode = False
+sw_embedding_debug_mode = True
 
 # Conduct basic safety checks, mainly on the user input.
 # Recommended to leave True, unless running time is of utmost importance, and the input is known to be consistent.
@@ -1068,7 +1068,7 @@ class ag:
                 # B is dense, so the gradient with respect to B should also be dense.
                 if len(broadcast_dims) > 0:
                     out_B = A*grad_output # This is still sparse and can be huge
-                    out_B = out_B.sum(dim=broadcast_dims)
+                    out_B = out_B.sum(dim=broadcast_dims) #TODO: suspected for slowness
 
                     # Restore original size as before sum()
                     for i in broadcast_dims:
@@ -1127,7 +1127,7 @@ class ag:
                 # B is dense, so the gradient with respect to B should also be dense.
                 if len(broadcast_dims) > 0:
                     out_B = A*grad_output # This is still sparse and can be huge
-                    out_B = out_B.sum(dim=broadcast_dims)
+                    out_B = out_B.sum(dim=broadcast_dims) # TODO: Similarly to mul_sparse_div, suspected for slowness
 
                     # Restore original size as before sum()
                     for i in broadcast_dims:
@@ -1299,7 +1299,8 @@ class ag:
             assert X.is_coalesced(), 'X must be coalesced'
 
             ctx.dim = dim if dim >= 0 else ( dim + X.dim() )
-            return sp.sparse_cumsum(X, dim=ctx.dim)
+            #return sp.sparse_cumsum(X, dim=ctx.dim)
+            return sp.sparse_cumsum_chatgpt(X, dim=ctx.dim)
 
         @staticmethod
         @once_differentiable
@@ -1308,7 +1309,8 @@ class ag:
 
             if ctx.needs_input_grad[0]:
                 G = sp.sparse_flip(grad_output, dim=dim)
-                G = sp.sparse_cumsum(G, dim=dim)
+                #G = sp.sparse_cumsum(G, dim=dim)
+                G = sp.sparse_cumsum_chatgpt(G, dim=dim)
                 grad_input = sp.sparse_flip(G, dim=dim)
             else:
                 grad_input = None
@@ -1475,6 +1477,51 @@ class sp:
         out_vals = A_vals / B[tuple(inds)]
 
         return sp.sparse_coo_tensor_coalesced(indices=inds, values=out_vals, size=A.shape)
+
+
+    def sparse_cumsum_chatgpt(sparse_tensor, dim):
+        # Ensure the input is a sparse tensor
+        if not sparse_tensor.is_sparse:
+            raise ValueError("Input tensor must be a sparse tensor.")
+        
+        # Make sure the tensor is coalesced to ensure unique indices
+        assert_coalesced(sparse_tensor)
+        
+        indices = sparse_tensor.indices()
+        values = sparse_tensor.values()
+
+        # Shape of the sparse tensor
+        shape = sparse_tensor.size()
+        
+        # Create a mask for all dimensions except the target one
+        mask = [slice(None)] * len(shape)
+        mask[dim] = None
+
+        # Get unique keys for grouping
+        keys = indices[mask].t()
+
+        # Sort keys and values based on keys and the dimension
+        sorted_keys, sorted_idx = torch.sort(keys, dim=0, stable=True)
+        sorted_indices = indices[:, sorted_idx]
+        sorted_values = values[sorted_idx]
+
+        # Perform cumsum on the sorted values
+        cumsum_values = torch.zeros_like(sorted_values)
+        
+        # Split and cumsum in each group
+        unique_keys, counts = torch.unique(sorted_keys, return_counts=True, dim=0)
+        start_idx = 0
+        for count in counts:
+            end_idx = start_idx + count
+            cumsum_values[start_idx:end_idx] = torch.cumsum(sorted_values[start_idx:end_idx], dim=0)
+            start_idx = end_idx
+        
+        # Create a new sparse tensor with cumulative sum values
+        sorted_indices, cumsum_values = sp.sort_inds_vals(indices=sorted_indices, values=cumsum_values, shape=sparse_tensor.shape, ensure_unique=True)
+        cumsum_sparse_tensor = sp.sparse_coo_tensor_coalesced(sorted_indices, cumsum_values, sparse_tensor.shape)
+        
+        return cumsum_sparse_tensor
+
 
     def sparse_cumsum(A, dim):
         assert A.is_sparse, 'A must be sparse'
