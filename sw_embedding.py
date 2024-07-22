@@ -4,10 +4,11 @@
 # Technion Institute of Technology
 # Haifa, Israel
 
-version = '1.26'
+version = '1.27'
 version_date = '2024-07-22'
 
 # Changelog:
+# 1.27   Made some slow assersions run only when sw_embedding_debug_mode or sw_embedding_basic_safety_checks are True
 # 1.26   Removed the sp_old class. Got rid of more coalesce()
 # 1.25c  Got rid of some more coalesce()
 # 1.25b  Got rid of some more coalesce()
@@ -28,11 +29,18 @@ from torch.autograd.function import once_differentiable
 
 import warnings
 import numbers
-import type_enforced
+import type_enforced # Important: A runtime error in this line implies that that some function below is given an arguemnt of the wrong type
 
 # Turn this on to run some verifications and sanity checks during runtime.
 # If an error is encountered, a runtime error is raised
 sw_embedding_debug_mode = False
+
+# Conduct basic safety checks, mainly on the user input.
+# Recommended to leave True, unless running time is of utmost importance, and the input is known to be consistent.
+# Examples of safety checks:
+# - Ensure that X and W do not contain infs and nans, and W only contains nonnegative values
+# - Ensure that all multisets/distributions represented by W have a positive total mass (i.e. not zero total mass or empty multisets)
+sw_embedding_basic_safety_checks = True
 
 
 ''' Maps multisets in R^d to vectors in R^m using the Sliced-Wasserstrin Embedding.
@@ -448,13 +456,13 @@ class SW_embedding(nn.Module):
         # This does not affect the result, but reduces the momery complexity by a factor of <number of slices> / t
 
         # Verify slices and frequencies at each forward pass if they are learnable
-        if self.learnable_slices:
+        if sw_embedding_basic_safety_checks and self.learnable_slices:
             assert not torch.isnan(self.projVecs).any(), 'Projection vectors contain NaNs'
             assert not torch.isinf(self.projVecs).any(), 'Projection vectors contain infs'
             # Note: We allow them to contain zero vectors when they are learnable, in case i.e. when sparsity is desired
             # assert not (self.projVecs == 0).all(dim=1).any(), 'Projection vectors contain a zero vector'
 
-        if self.learnable_freqs:
+        if sw_embedding_basic_safety_checks and self.learnable_freqs:
             assert not torch.isnan(self.freqs).any(), 'Frequencies contain NaNs'
             assert not torch.isinf(self.freqs).any(), 'Frequencies contain infs'
 
@@ -464,8 +472,10 @@ class SW_embedding(nn.Module):
         assert W is None or torch.is_tensor(W), 'W must be a pytorch tensor. Instead got type %s' % (type(W))
         assert X.dtype == self.get_dtype(), ( "X has the wrong dtype. Expected %s, got %s" % (self.get_dtype(), X.dtype) )
         assert X.device == self.get_device(), ( "X is on the wrong device. Expected %s, got %s" % (self.get_device(), X.device) )
-        assert not torch.isnan(X).any(), "The entries of X cannot contain NaNs"
-        assert not torch.isinf(X).any(), "All entries of X must be finite"
+
+        if sw_embedding_basic_safety_checks:
+            assert not torch.isnan(X).any(), "The entries of X cannot contain NaNs"
+            assert not torch.isinf(X).any(), "All entries of X must be finite"
 
         if W is not None:
             # Check if W is sparse. If so, ensure that W is of the correct layout.            
@@ -476,19 +486,24 @@ class SW_embedding(nn.Module):
                 assert W.layout == torch.sparse_coo, ( "Sparse W has an unsupported sparsity layout '%s'. Only the COO layout (torch.sparse_coo) is currently supported." % (W.layout) )
 
                 assert W.is_coalesced(), 'Sparse W must be coalesced'
-                W_vals = W.values()
+
+                if sw_embedding_basic_safety_checks:
+                    W_vals = W.values()
             else:
-                W_vals = W
+                if sw_embedding_basic_safety_checks:
+                    W_vals = W
 
             assert W.dtype == self.get_dtype(), ( "W has the wrong dtype. Expected %s, got %s" % (self.get_dtype(), W.dtype) )
             assert W.device == self.get_device(), ( "W is on the wrong device. Expected %s, got %s" % (self.get_device(), W.device) )
-            assert not torch.isnan(W_vals).any(), "W cannot contain NaNs"
-            assert not torch.isinf(W_vals).any(), "All entries of W must be finite"
-            assert (W_vals >= 0).all(), "All entries of W must be nonnegative"
-            assert (W_vals > 0).any(dim=-1).all(), "W assigns an all-zero weight to one of its distributions"
 
-            if W.requires_grad and (W_vals == 0).any():
-                warnings.warn('Gradients of W may be incorrect at indices where W=0. Use W = SW_embedding.project_W(W, eps) with eps > 0')
+            if sw_embedding_basic_safety_checks:
+                assert not torch.isnan(W_vals).any(), "W cannot contain NaNs"
+                assert not torch.isinf(W_vals).any(), "All entries of W must be finite"
+                assert (W_vals >= 0).all(), "All entries of W must be nonnegative"
+                assert (W_vals > 0).any(dim=-1).all(), "W assigns an all-zero weight to one of its distributions"
+
+                if W.requires_grad and (W_vals == 0).any():
+                    warnings.warn('Gradients of W may be incorrect at indices where W=0. Use W = SW_embedding.project_W(W, eps) with eps > 0')
 
 
         ### B. Verify input sizes
@@ -753,8 +768,9 @@ class SW_embedding(nn.Module):
                 inds = W.indices()
                 vals = W.values()
 
-                assert not torch.isinf(vals).any(), 'W cannot contain infinite values'
-                assert not torch.isnan(vals).any(), 'W cannot contain NaNs'
+                if sw_embedding_basic_safety_checks:
+                    assert not torch.isinf(vals).any(), 'W cannot contain infinite values'
+                    assert not torch.isnan(vals).any(), 'W cannot contain NaNs'
 
                 vals = torch.clamp(vals, min=eps)
 
@@ -762,16 +778,20 @@ class SW_embedding(nn.Module):
                 
                 W_sum = ag.sum_sparseToDense.apply(W, -1)
 
-                assert not (W_sum == 0).any(), "W assigns an all-zero weight to one of its distributions"
+                if sw_embedding_basic_safety_checks:
+                    assert not (W_sum == 0).any(), "W assigns an all-zero weight to one of its distributions"
+
                 W = ag.div_sparse_dense.apply(W, W_sum)
             
             else:
-                assert not torch.isinf(W).any(), 'W cannot contain infinite values'
-                assert not torch.isnan(W).any(), 'W cannot contain NaNs'
+                if sw_embedding_basic_safety_checks:
+                    assert not torch.isinf(W).any(), 'W cannot contain infinite values'
+                    assert not torch.isnan(W).any(), 'W cannot contain NaNs'
 
                 W = torch.clamp(W, min=eps)
 
-                assert (W > 0).any(dim=-1).all(), "W assigns an all-zero weight to one of its distributions"
+                if sw_embedding_basic_safety_checks:
+                    assert (W > 0).any(dim=-1).all(), "W assigns an all-zero weight to one of its distributions"
 
                 W = W / torch.sum(W, dim=-1, keepdim=True)
 
@@ -804,13 +824,6 @@ class SW_embedding(nn.Module):
 #############################################################################################################
 ##                                                  Tools                                                  ##
 #############################################################################################################
-
-# Used for verify assertions only in debug mode.
-def assert_debug(condition, message):
-    debug = sw_embedding_debug_mode # Set this to True to verify the input assertions
-
-    if debug:
-        assert condition, message
 
 def assert_coalesced(A):
     debug = sw_embedding_debug_mode
@@ -1001,7 +1014,7 @@ class ag:
 
 
     # Equivalent to: A*B, where A is sparse, B is dense, and the shape of B is broadcastable to A
-    class mul_sparse_dense(torch.autograd.Function):
+    class mul_sparse_dense(torch.autograd.Function): # TODO: Try to get rid of coalesce here
         @staticmethod
         def forward(ctx, A, B):
             assert A.is_sparse, 'A must be sparse'
@@ -1077,7 +1090,9 @@ class ag:
             assert not B.is_sparse, 'B cannot be sparse'
             assert (torch.logical_or(torch.tensor(A.shape) == torch.tensor(B.shape), torch.tensor(B.shape) == 1)).all(), "B must be of size that allows broadcasting to A"
             assert A.is_coalesced(), 'A must be coalesced'
-            assert (B > 0).all(), 'B cannot contain zeros'
+
+            if sw_embedding_debug_mode:
+                assert (B > 0).all(), 'B cannot contain zeros'
 
             broadcast_dims = tuple(torch.nonzero(torch.tensor(B.shape) == 1))
 
@@ -1138,7 +1153,8 @@ class ag:
             assert_coalesced(A)
             assert_coalesced(B)
 
-            assert (A.indices() == B.indices()).all(), 'A and B nonzero indices do not match'
+            if sw_embedding_debug_mode:
+                assert (A.indices() == B.indices()).all(), 'A and B nonzero indices do not match'
 
             inds = A.indices()
 
@@ -1182,7 +1198,9 @@ class ag:
             assert (A.shape == B.shape), 'A and B must have the same shape'
             assert A.is_coalesced(), 'A must be coalesced'
             assert B.is_coalesced(), 'B must be coalesced'
-            assert (A.indices() == B.indices()).all(), 'A and B nonzero indices do not match'
+
+            if sw_embedding_debug_mode:
+                assert (A.indices() == B.indices()).all(), 'A and B nonzero indices do not match'
 
             inds = A.indices()
 
@@ -1442,7 +1460,7 @@ class sp:
 
 
     # Entrywise division of sparse A by dense A. Supports broadcasting of B to A.
-    def div_sparse_dense(A,B):
+    def div_sparse_dense(A,B): # TODO: Try to get rid of coalesce here
         assert A.is_sparse, 'A must be sparse'
         assert not B.is_sparse, 'B must be dense'
         assert (torch.logical_or(torch.tensor(A.shape) == torch.tensor(B.shape), torch.tensor(B.shape) == 1)).all(), "B must be of size that allows broadcasting to A"
