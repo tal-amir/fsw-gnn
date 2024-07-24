@@ -4,10 +4,11 @@
 # Technion Institute of Technology
 # Haifa, Israel
 
-version = '1.28t2'
+version = '1.28t3'
 version_date = '2024-07-22'
 
 # Changelog:
+# 1.28t3  Added cumsum_segments_consecutive
 # 1.28t2  Testing cumsum_segments using jit
 # 1.28t1  Testing sparse_cumsum_alt1
 # 1.27    Made some slow assersions run only when sw_embedding_debug_mode or sw_embedding_basic_safety_checks are True
@@ -1405,7 +1406,7 @@ class ag:
 class sp:
     # Create a COO sparse tensor in a coalesced state, assuming that the input indices are already coalesced.
     # If the command sp.verify_coalescence(out) is not commented, the tensor is verified for being correctly coalesced.
-    def sparse_coo_tensor_coalesced(indices, values, size):
+    def sparse_coo_tensor_coalesced(indices, values, size:list[int]):
         out = torch.sparse_coo_tensor(indices=indices, values=values, size=size, is_coalesced=True)
         debug = sw_embedding_debug_mode
 
@@ -1509,7 +1510,7 @@ class sp:
 
     @torch.jit.script
     def cumsum_segments_consecutive(A, start_inds, end_inds):        
-        nSegments = len(start_inds)
+        nSegments = len(start_inds)        
         out = torch.empty_like(A)
         for i in range(nSegments):
             out[start_inds[i]:end_inds[i]] = torch.cumsum(A[start_inds[i]:end_inds[i]], dim=0)
@@ -1551,10 +1552,10 @@ class sp:
         
         # Sort the values and split them according to the keys at the corrsponding indices
         vals_sorted = vals[sort_inds]
-        vals_split = torch.split(vals_sorted, list(counts), dim=0)
+        #vals_split = torch.split(vals_sorted, list(counts), dim=0)
 
         if True:       
-            vals_sorted_cumsum = sp.cumsum_segments(vals_sorted, start_inds, end_inds)
+            vals_sorted_cumsum = sp.cumsum_segments_consecutive(vals_sorted, start_inds, end_inds)
         else:
             s = time.time()
             streams = [torch.cuda.Stream() for _ in range(len(vals_split))]
