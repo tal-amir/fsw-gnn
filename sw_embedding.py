@@ -1507,6 +1507,14 @@ class sp:
             stream.synchronize()
         return out
 
+    @torch.jit.script
+    def cumsum_segments_consecutive(A, start_inds, end_inds):        
+        nSegments = len(start_inds)
+        out = torch.empty_like(A)
+        for i in range(nSegments):
+            out[start_inds[i]:end_inds[i]] = torch.cumsum(A[start_inds[i]:end_inds[i]], dim=0)
+        return out
+
 
     #@torch.jit.script
     def sparse_cumsum_alt1(A, dim):
