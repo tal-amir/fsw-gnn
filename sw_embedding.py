@@ -4,36 +4,40 @@
 # Technion Institute of Technology
 # Haifa, Israel
 
-version = '1.28'
+version = '1.28t1'
 version_date = '2024-07-22'
 
 # Changelog:
-# 1.27   Made some slow assersions run only when sw_embedding_debug_mode or sw_embedding_basic_safety_checks are True
-# 1.26   Removed the sp_old class. Got rid of more coalesce()
-# 1.25c  Got rid of some more coalesce()
-# 1.25b  Got rid of some more coalesce()
-# 1.25   Removed most of coalesce() calls that follow calls to torch.sparse_coo_tensor()
-# 1.24   Removed attributes 'device' and 'dtype' from SW_embedding due to lack of safety. Use get_device(), get_dtype() instead.
-# 1.23   Added project_W()
-# 1.22   Added support for biases
-#        learnable_freqs=True now initializes frequencies to zero
-# 1.21   Added reset_parameters()
-#        Added type hinting and enforcement
+# 1.28t1  Testing sparse_cumsum_alt1
+# 1.27    Made some slow assersions run only when sw_embedding_debug_mode or sw_embedding_basic_safety_checks are True
+# 1.26    Removed the sp_old class. Got rid of more coalesce()
+# 1.25c   Got rid of some more coalesce()
+# 1.25b   Got rid of some more coalesce()
+# 1.25    Removed most of coalesce() calls that follow calls to torch.sparse_coo_tensor()
+# 1.24    Removed attributes 'device' and 'dtype' from SW_embedding due to lack of safety. Use get_device(), get_dtype() instead.
+# 1.23    Added project_W()
+# 1.22    Added support for biases
+#         learnable_freqs=True now initializes frequencies to zero
+# 1.21    Added reset_parameters()
+#         Added type hinting and enforcement
 
 
 import numpy as np
 
 import torch
 import torch.nn as nn
+import torch.multiprocessing as mp
 from torch.autograd.function import once_differentiable
 
 import warnings
 import numbers
 import type_enforced # A runtime error in this line implies that that some function below is given an input arguemnt of the wrong type
 
+import time
+
 # Turn this on to run some verifications and sanity checks during runtime.
 # If an error is encountered, a runtime error is raised
-sw_embedding_debug_mode = True
+sw_embedding_debug_mode = False
 
 # Conduct basic safety checks, mainly on the user input.
 # Recommended to leave True, unless running time is of utmost importance, and the input is known to be consistent.
@@ -1300,7 +1304,7 @@ class ag:
 
             ctx.dim = dim if dim >= 0 else ( dim + X.dim() )
             #return sp.sparse_cumsum(X, dim=ctx.dim)
-            return sp.sparse_cumsum_chatgpt(X, dim=ctx.dim)
+            return sp.sparse_cumsum_alt1(X, dim=ctx.dim)
 
         @staticmethod
         @once_differentiable
@@ -1310,7 +1314,7 @@ class ag:
             if ctx.needs_input_grad[0]:
                 G = sp.sparse_flip(grad_output, dim=dim)
                 #G = sp.sparse_cumsum(G, dim=dim)
-                G = sp.sparse_cumsum_chatgpt(G, dim=dim)
+                G = sp.sparse_cumsum_alt1(G, dim=dim)
                 grad_input = sp.sparse_flip(G, dim=dim)
             else:
                 grad_input = None
@@ -1429,6 +1433,9 @@ class sp:
         assert indices.dim() == 2, 'indices must be a 2-dimensional tensor'
         nd = indices.shape[0]
 
+        if not isinstance(shape, torch.Tensor):
+            shape = torch.tensor(shape, device=indices.device, dtype=indices.dtype)
+
         weights = shape.reshape([nd,1]).flip(dims=(0,))[0:-1].cumprod(dim=0).flip(dims=(0,))
         weights = torch.cat((weights, torch.ones(size=(1,1), device=weights.device, dtype=weights.dtype)), dim=0)
 
@@ -1461,6 +1468,7 @@ class sp:
         return (indices[:,sort_perm], values[sort_perm])
 
 
+
     # Entrywise division of sparse A by dense A. Supports broadcasting of B to A.
     def div_sparse_dense(A,B): # TODO: Try to get rid of coalesce here
         assert A.is_sparse, 'A must be sparse'
@@ -1479,50 +1487,81 @@ class sp:
         return sp.sparse_coo_tensor_coalesced(indices=inds, values=out_vals, size=A.shape)
 
 
-    def sparse_cumsum_chatgpt(sparse_tensor, dim):
+    def cumsum_worker(tensor, output_list, index):
+        result = torch.cumsum(tensor, dim=0)        
+        output_list[index] = result
+
+    def sparse_cumsum_alt1(A, dim):
         # Ensure the input is a sparse tensor
-        if not sparse_tensor.is_sparse:
+        if not A.is_sparse:
             raise ValueError("Input tensor must be a sparse tensor.")
         
-        # Make sure the tensor is coalesced to ensure unique indices
-        assert_coalesced(sparse_tensor)
+        # Coalesce the tensor to ensure unique indices
+        assert_coalesced(A)
         
-        indices = sparse_tensor.indices()
-        values = sparse_tensor.values()
-
+        inds = A.indices()
+        vals = A.values()
+        
         # Shape of the sparse tensor
-        shape = sparse_tensor.size()
+        shape = list(A.shape)
         
-        # Create a mask for all dimensions except the target one
-        mask = [slice(None)] * len(shape)
-        mask[dim] = None
-
-        # Get unique keys for grouping
-        keys = indices[mask].t()
-
-        # Sort keys and values based on keys and the dimension
-        sorted_keys, sorted_idx = torch.sort(keys, dim=0, stable=True)
-        sorted_indices = indices[:, sorted_idx]
-        sorted_values = values[sorted_idx]
-
-        # Perform cumsum on the sorted values
-        cumsum_values = torch.zeros_like(sorted_values)
+        # Get the other dimensions excluding the one we're summing over,
+        # and get the shape along these dimensions.
+        dims2 = [d for d in range(len(shape)) if d != dim]
+        shape2 = [shape[d] for d in range(len(shape)) if d != dim]
         
-        # Split and cumsum in each group
-        unique_keys, counts = torch.unique(sorted_keys, return_counts=True, dim=0)
-        start_idx = 0
-        for count in counts:
-            end_idx = start_idx + count
-            cumsum_values[start_idx:end_idx] = torch.cumsum(sorted_values[start_idx:end_idx], dim=0)
-            start_idx = end_idx
+        # Get the unique keys for the other dimensions
+        keys = sp.ravel_index(inds[dims2,:], shape2)
+
+        # Sort the keys and get the counts of each unique key
+        keys_sorted, sort_inds = torch.sort(keys, dim=0, stable=True)
+        _, counts = torch.unique_consecutive(keys_sorted, return_counts=True)
+
+        start_inds = torch.cumsum(counts, dim=0)        
+        start_inds = torch.cat( (torch.zeros(1, device=start_inds.device, dtype=start_inds.dtype), start_inds[0:-1]), dim=0)
+        
+        # Sort the values and split them according to the keys at the corrsponding indices
+        vals_sorted = vals[sort_inds]
+        vals_split = torch.split(vals_sorted, list(counts), dim=0)
+       
+        s = time.time()
+        streams = [torch.cuda.Stream() for _ in range(len(vals_split))]
+        t = time.time()-s
+        #print('Stream creation time: ', t)
+
+        # Asynchronously apply the cumsum function to each slice using its own stream
+        s = time.time()
+        #vals_sorted_cumsum = torch.empty_like(vals_sorted)
+        results = []
+        for i, slice in enumerate(vals_split):
+            with torch.cuda.stream(streams[i]):
+                result = torch.cumsum(slice, dim=0)
+                results.append(result)
+                #vals_sorted_cumsum[start_inds[i]:(start_inds[i]+counts[i])] = torch.cumsum(slice, dim=0)
+        t = time.time()-s
+        #print('Result calculation time: ', t)
+
+        # Wait for all streams to complete
+        s = time.time()
+        for stream in streams:
+            stream.synchronize()
+        t = time.time()-s
+        #print('Synchronize time: ', t)
+
+        s = time.time()
+        vals_sorted_cumsum = torch.cat(results, dim=0)
+        t = time.time()-s
+        #print('cat time: ', t)
+
+        perm_inv = torch.argsort(sort_inds, dim=0)
+        vals_out = vals_sorted_cumsum[perm_inv]
         
         # Create a new sparse tensor with cumulative sum values
-        sorted_indices, cumsum_values = sp.sort_inds_vals(indices=sorted_indices, values=cumsum_values, shape=sparse_tensor.shape, ensure_unique=True)
-        cumsum_sparse_tensor = sp.sparse_coo_tensor_coalesced(sorted_indices, cumsum_values, sparse_tensor.shape)
+        out = sp.sparse_coo_tensor_coalesced(indices=inds, values=vals_out, size=shape)
         
-        return cumsum_sparse_tensor
-
-
+        return out
+        
+    
     def sparse_cumsum(A, dim):
         assert A.is_sparse, 'A must be sparse'
         assert not torch.is_grad_enabled(), 'This function can only be called within torch.no_grad(), as it is not meant to calculate gradients.'
