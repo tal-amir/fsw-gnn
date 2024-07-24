@@ -1503,6 +1503,8 @@ class sp:
                 #result = torch.cumsum(slice, dim=0)
                 #results.append(result)
                 out[start_inds[i]:end_inds[i]] = torch.cumsum(A[start_inds[i]:end_inds[i]], dim=0)
+        for stream in streams:
+            stream.synchronize()
         return out
 
 
