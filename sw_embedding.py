@@ -1491,7 +1491,7 @@ class sp:
         result = torch.cumsum(tensor, dim=0)        
         output_list[index] = result
 
-    @torch.jit.script
+    #@torch.jit.script
     def sparse_cumsum_alt1(A, dim):
         # Ensure the input is a sparse tensor
         if not A.is_sparse:
