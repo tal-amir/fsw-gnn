@@ -79,18 +79,18 @@ def segcumsum(input_tensor, segment_ids, max_seg_size=None):
     torch.cuda.synchronize()
 
     # Launch the add_block_sums_wrapper
-    libsegcumsum.add_block_sums_wrapper(
-        ctypes.c_void_p(output_ptr),
-        ctypes.c_void_p(block_sums_ptr),
-        ctypes.c_void_p(segment_ids_ptr),
-        ctypes.c_void_p(block_last_id_ptr),
-        ctypes.c_int(input_tensor.numel()),
-        ctypes.c_int(num_blocks),
-        ctypes.c_int(threads_per_block)
-    )
+    # libsegcumsum.add_block_sums_wrapper(
+    #     ctypes.c_void_p(output_ptr),
+    #     ctypes.c_void_p(block_sums_ptr),
+    #     ctypes.c_void_p(segment_ids_ptr),
+    #     ctypes.c_void_p(block_last_id_ptr),
+    #     ctypes.c_int(input_tensor.numel()),
+    #     ctypes.c_int(num_blocks),
+    #     ctypes.c_int(threads_per_block)
+    # )
 
-    # Synchronize to ensure the final result is ready
-    torch.cuda.synchronize()
+    # # Synchronize to ensure the final result is ready
+    # torch.cuda.synchronize()
 
     return output_tensor
 
