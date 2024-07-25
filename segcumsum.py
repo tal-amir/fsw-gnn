@@ -125,7 +125,7 @@ def segcumsum(input_tensor, segment_ids, max_seg_size=None):
 
     # print('----------------')
 
-    for i in reversed(range(len(tensor_sizes)-1)):
+    for i in reversed(range(len(tensor_sizes)-2)):
         # Launch the add_block_sums_wrapper
         libsegcumsum.add_block_sums_wrapper(
             ctypes.c_void_p(output_tensors[i].data_ptr()),
