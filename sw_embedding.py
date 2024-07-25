@@ -4,10 +4,11 @@
 # Technion Institute of Technology
 # Haifa, Israel
 
-version = '1.28t3'
-version_date = '2024-07-22'
+version = '1.29'
+version_date = '2024-07-25'
 
 # Changelog:
+# 1.29    Added CUDA-implemented segcumsum!
 # 1.28t3  Added cumsum_segments_consecutive
 # 1.28t2  Testing cumsum_segments using jit
 # 1.28t1  Testing sparse_cumsum_alt1
@@ -36,6 +37,8 @@ import numbers
 import type_enforced # A runtime error in this line implies that that some function below is given an input arguemnt of the wrong type
 
 import time
+
+from segcumsum import segcumsum
 
 # Turn this on to run some verifications and sanity checks during runtime.
 # If an error is encountered, a runtime error is raised
@@ -1489,35 +1492,6 @@ class sp:
         return sp.sparse_coo_tensor_coalesced(indices=inds, values=out_vals, size=A.shape)
 
 
-    def cumsum_worker(tensor, output_list, index):
-        result = torch.cumsum(tensor, dim=0)        
-        output_list[index] = result
-
-
-    @torch.jit.script
-    def cumsum_segments(A, start_inds, end_inds):        
-        nSegments = len(start_inds)
-        streams = [torch.cuda.Stream() for _ in range(nSegments)]
-        out = torch.empty_like(A)
-        for i in range(nSegments):
-            with torch.cuda.stream(streams[i]):
-                #result = torch.cumsum(slice, dim=0)
-                #results.append(result)
-                out[start_inds[i]:end_inds[i]] = torch.cumsum(A[start_inds[i]:end_inds[i]], dim=0)
-        for stream in streams:
-            stream.synchronize()
-        return out
-
-    @torch.jit.script
-    def cumsum_segments_consecutive(A, start_inds, end_inds):        
-        nSegments = len(start_inds)        
-        out = torch.empty_like(A)
-        for i in range(nSegments):
-            out[start_inds[i]:end_inds[i]] = torch.cumsum(A[start_inds[i]:end_inds[i]], dim=0)
-        return out
-
-
-    #@torch.jit.script
     def sparse_cumsum_alt1(A, dim):
         # Ensure the input is a sparse tensor
         if not A.is_sparse:
@@ -1536,8 +1510,6 @@ class sp:
         # and get the shape along these dimensions.
         dims2 = [d for d in range(len(shape)) if d != dim]
         shape2 = [shape[d] for d in range(len(shape)) if d != dim]
-        #dims2 = list(range(len(shape))).remove(dim)
-        #shape2 = [shape[i] for i in dims2]
         
         # Get the unique keys for the other dimensions
         keys = sp.ravel_index(inds[dims2,:], shape2)
@@ -1545,46 +1517,12 @@ class sp:
         # Sort the keys and get the counts of each unique key
         keys_sorted, sort_inds = torch.sort(keys, dim=0, stable=True)
         _, counts = torch.unique_consecutive(keys_sorted, return_counts=True)
+        max_seg_size = torch.max(counts)
 
-        start_inds = torch.cumsum(counts, dim=0)        
-        start_inds = torch.cat( (torch.zeros(1, device=start_inds.device, dtype=start_inds.dtype), start_inds[0:-1]), dim=0)
-        end_inds = start_inds + counts
-        
-        # Sort the values and split them according to the keys at the corrsponding indices
+        # Sort the values according to the keys, to form contiguous segments
         vals_sorted = vals[sort_inds]
-        #vals_split = torch.split(vals_sorted, list(counts), dim=0)
 
-        if True:       
-            vals_sorted_cumsum = sp.cumsum_segments_consecutive(vals_sorted, start_inds, end_inds)
-        else:
-            s = time.time()
-            streams = [torch.cuda.Stream() for _ in range(len(vals_split))]
-            t = time.time()-s
-            #print('Stream creation time: ', t)
-
-            # Asynchronously apply the cumsum function to each slice using its own stream
-            s = time.time()
-            vals_sorted_cumsum = torch.empty_like(vals_sorted)
-            #results = []
-            for i, slice in enumerate(vals_split):
-                with torch.cuda.stream(streams[i]):
-                    #result = torch.cumsum(slice, dim=0)
-                    #results.append(result)
-                    vals_sorted_cumsum[start_inds[i]:end_inds[i]] = torch.cumsum(slice, dim=0)
-            t = time.time()-s
-            #print('Result calculation time: ', t)
-
-            # Wait for all streams to complete
-            s = time.time()
-            for stream in streams:
-                stream.synchronize()
-            t = time.time()-s
-            #print('Synchronize time: ', t)
-
-            s = time.time()
-            #vals_sorted_cumsum = torch.cat(results, dim=0)
-            t = time.time()-s
-            #print('cat time: ', t)
+        vals_sorted_cumsum = segcumsum(vals_sorted, keys_sorted, max_seg_size)
 
         perm_inv = torch.argsort(sort_inds, dim=0)
         vals_out = vals_sorted_cumsum[perm_inv]
