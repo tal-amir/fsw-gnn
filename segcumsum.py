@@ -27,6 +27,7 @@ def segcumsum(input_tensor, segment_ids, max_seg_size=None):
         # Calculate maximal segmet size
         _, counts = torch.unique_consecutive(segment_ids, return_counts=True)
         max_seg_size = int(torch.max(counts))
+        del counts
 
     # Construct block hierarchy
     tensor_sizes = [ input_tensor.numel(), ]
@@ -59,13 +60,6 @@ def segcumsum(input_tensor, segment_ids, max_seg_size=None):
         output_tensors.append(output_tensor_new)
         id_tensors.append(id_tensor_new)
 
-    # # Get pointers to the tensors
-    # input_ptr = input_tensor.data_ptr()
-    # segment_ids_ptr = segment_ids.data_ptr()
-    # output_ptr = output_tensor.data_ptr()
-    # block_sums_ptr = block_sums.data_ptr()
-    # block_last_id_ptr = block_last_id.data_ptr()
-    
 
     # Define the kernel signatures
     libsegcumsum.segcumsum_wrapper.argtypes = [
@@ -93,7 +87,6 @@ def segcumsum(input_tensor, segment_ids, max_seg_size=None):
     ]
     libsegcumsum.add_block_sums_wrapper.restype = None
 
-    # print('----------------')
 
     for i,s in enumerate(tensor_sizes):
         return_next_level = i < (len(tensor_sizes)-1)
@@ -112,18 +105,8 @@ def segcumsum(input_tensor, segment_ids, max_seg_size=None):
             ctypes.c_size_t(shared_memory_size)
         )
 
-        # print('Level %d:' % (i))
-        # print('Output tensor: ', output_tensors[i])
-
-        # if return_next_level:
-        #     print('Next level sums: ', output_tensors[i+1])
-        #     print('Next level ids: ', id_tensors[i+1])
-
-
-        # Synchronize to ensure all blocks have completed before the second kernel
         torch.cuda.synchronize()
 
-    # print('----------------')
 
     for i in reversed(range(len(tensor_sizes)-2)):
         # Launch the add_block_sums_wrapper
@@ -135,10 +118,10 @@ def segcumsum(input_tensor, segment_ids, max_seg_size=None):
             ctypes.c_int(tensor_sizes[i]),
             ctypes.c_int(num_blocks[i]),
             ctypes.c_int(threads_per_block)
-    )
+        )
 
-    # Synchronize to ensure the final result is ready
-    torch.cuda.synchronize()
+        # Synchronize to ensure the final result is ready
+        torch.cuda.synchronize()
 
     return output_tensors[0]
 

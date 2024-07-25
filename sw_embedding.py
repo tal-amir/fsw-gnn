@@ -1518,15 +1518,21 @@ class sp:
 
         # Sort the keys and get the counts of each unique key
         keys_sorted, sort_inds = torch.sort(keys, dim=0, stable=True)
+        del keys
+
         _, counts = torch.unique_consecutive(keys_sorted, return_counts=True)
         max_seg_size = torch.max(counts)
+        del counts
 
         # Sort the values according to the keys, to form contiguous segments
         vals_sorted = vals[sort_inds]
 
         vals_sorted_cumsum = segcumsum(vals_sorted, keys_sorted, max_seg_size)
+        del vals_sorted
 
         perm_inv = torch.argsort(sort_inds, dim=0)
+        del sort_inds
+        
         vals_out = vals_sorted_cumsum[perm_inv]
         
         # Create a new sparse tensor with cumulative sum values
