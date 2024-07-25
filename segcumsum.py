@@ -8,7 +8,7 @@ libsegcumsum = ctypes.CDLL(os.path.abspath("libsegcumsum.so"))
 # Segmented Cumulative Sum
 # This is a wrapper function that calls CUDA kernels
 def segcumsum(input_tensor, segment_ids, max_seg_size=None):
-    default_num_threads_per_block = 7
+    default_num_threads_per_block = 256
 
     # Determine some CUDA properties
     device_index = torch.cuda.current_device()
