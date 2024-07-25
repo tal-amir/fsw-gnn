@@ -10,7 +10,7 @@
     }                                                           \
 }
 
-extern "C" __global__ void segcumsum_kernel(const float* input, const int* segment_ids, int max_seg_size, float* output, float* block_sums, int* block_last_id, int size) {
+extern "C" __global__ void segcumsum_kernel(float* values, const int* segment_ids, int size, int max_seg_size, float* block_sums_out, int* block_last_ids_out, bool return_next_level) {
     extern __shared__ float shared_data[];
 
     int tid = threadIdx.x;
@@ -18,7 +18,7 @@ extern "C" __global__ void segcumsum_kernel(const float* input, const int* segme
 
     // Load input into shared memory
     if (index < size) {
-        shared_data[tid] = input[index];
+        shared_data[tid] = values[index];
     } else {
         shared_data[tid] = 0.0f;
     }
@@ -60,13 +60,13 @@ extern "C" __global__ void segcumsum_kernel(const float* input, const int* segme
 
     // Write results to output
     if (index < size) {
-        output[index] = shared_data[tid];
+        values[index] = shared_data[tid];
     }
 
     // Write block sums
-    if (tid == blockDim.x - 1) {
-        block_sums[blockIdx.x] = shared_data[tid];
-        block_last_id[blockIdx.x] = segment_ids[index];
+    if (return_next_level && (tid == blockDim.x - 1)) {
+        block_sums_out[blockIdx.x] = shared_data[tid];
+        block_last_ids_out[blockIdx.x] = segment_ids[index];
     }
 }
 
@@ -77,29 +77,14 @@ extern "C" __global__ void add_block_sums_kernel(float* output, const float* blo
     int index = blockIdx.x * blockDim.x + tid;
     int id_curr = segment_ids[index];
 
-    // if ((blockIdx.x >= 1) && (block_last_id[blockIdx.x-1] == id_curr))
-    // {
-    //     output[index] += block_sums[blockIdx.x-1];
-    // }
-
-    // Calculate the sum of previous block sums
-    float block_sum = 0.0f;
-
-    for (int i = blockIdx.x-1; i >= 0; --i) {
-        if (block_last_id[i] == id_curr)
-            block_sum += block_sums[i];
-        else
-            break;
-    }
-
-    // Adjust the cumulative sum with the block sums
-    if (index < size) {
-        output[index] += block_sum;
+    if ((blockIdx.x >= 1) && (block_last_id[blockIdx.x-1] == id_curr))
+    {
+        output[index] += block_sums[blockIdx.x-1];
     }
 }
 
-extern "C" void segcumsum_wrapper(const float* input, const int* segment_ids, int max_seg_size, float* output, float* block_sums, int* block_last_id, int size, int blocks, int threads_per_block, size_t shared_memory_size) {
-    segcumsum_kernel<<<blocks, threads_per_block, shared_memory_size>>>(input, segment_ids, max_seg_size, output, block_sums, block_last_id, size);
+extern "C" void segcumsum_wrapper(float* values, const int* segment_ids, int size, int max_seg_size, float* block_sums_out, int* block_last_ids_out, bool return_next_level, int blocks, int threads_per_block, size_t shared_memory_size) {
+    segcumsum_kernel<<<blocks, threads_per_block, shared_memory_size>>>(values, segment_ids, size, max_seg_size, block_sums_out, block_last_ids_out, return_next_level);
     CHECK_CUDA_ERROR(cudaGetLastError());
     CHECK_CUDA_ERROR(cudaDeviceSynchronize());
 }
