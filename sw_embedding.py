@@ -4,10 +4,11 @@
 # Technion Institute of Technology
 # Haifa, Israel
 
-version = '1.29'
+version = '1.30'
 version_date = '2024-07-25'
 
 # Changelog:
+# 1.30    Added CUDA-implemented segcumsum, still slow
 # 1.29    Added CUDA-implemented segcumsum!
 # 1.28t3  Added cumsum_segments_consecutive
 # 1.28t2  Testing cumsum_segments using jit
