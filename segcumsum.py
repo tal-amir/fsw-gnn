@@ -8,10 +8,10 @@ libsegcumsum = ctypes.CDLL(os.path.abspath("libsegcumsum.so"))
 # Segmented Cumulative Sum
 # This is a wrapper function that calls CUDA kernels
 def segcumsum(input_tensor, segment_ids, max_seg_size=None):
-    default_num_threads_per_block = 256
+    default_num_threads_per_block = 2
 
     # Determine some CUDA properties
-    device_index = torch.cuda.current_device()
+    device_index = torch.cuda.device(input_tensor.device)
     device_properties = torch.cuda.get_device_properties(device_index)
     max_threads_per_block = device_properties.max_threads_per_multi_processor # Not sure this is the right property    
 
@@ -54,8 +54,15 @@ def segcumsum(input_tensor, segment_ids, max_seg_size=None):
             output_tensor_new = torch.clone(input_tensor, memory_format=torch.contiguous_format)
             id_tensor_new = segment_ids
         else:
-            output_tensor_new = torch.empty(size=(s,), device=input_tensor.device, dtype=input_tensor.dtype)
-            id_tensor_new = torch.empty(size=(s,), device=segment_ids.device, dtype=segment_ids.dtype)
+            output_tensor_new = torch.empty(size=(s,), device=input_tensor.device, dtype=input_tensor.dtype, memory_format=torch.contiguous_format)
+            id_tensor_new = torch.empty(size=(s,), device=segment_ids.device, dtype=segment_ids.dtype, memory_format=torch.contiguous_format)
+
+        #TODO: Remove
+        # output_tensor_new = torch.empty(size=(s,), device=input_tensor.device, dtype=input_tensor.dtype, memory_format=torch.contiguous_format)
+        # id_tensor_new = torch.empty(size=(s,), device=segment_ids.device, dtype=segment_ids.dtype, memory_format=torch.contiguous_format)
+
+        # output_tensor_new[:] = 8
+        # id_tensor_new[:] = 8
 
         output_tensors.append(output_tensor_new)
         id_tensors.append(id_tensor_new)
@@ -89,7 +96,7 @@ def segcumsum(input_tensor, segment_ids, max_seg_size=None):
 
 
     for i,s in enumerate(tensor_sizes):
-        return_next_level = i < (len(tensor_sizes)-1)
+        return_next_level = ( i < (len(tensor_sizes) - 1) )
 
         # Launch the segcumsum_wrapper
         libsegcumsum.segcumsum_wrapper(
@@ -107,8 +114,12 @@ def segcumsum(input_tensor, segment_ids, max_seg_size=None):
 
         torch.cuda.synchronize()
 
+    for i in reversed(range(len(tensor_sizes)-1)):
+        # print('Running level %d. First level: %d' %(i, len(tensor_sizes)-2) )
+        # print('Tensor size: ', tensor_sizes[i], output_tensors[i].numel(), id_tensors[i].numel())
+        # print('Num blocks: ', num_blocks[i], output_tensors[i+1].numel(), id_tensors[i+1].numel())
+        # print('Num levels: ', len(output_tensors))
 
-    for i in reversed(range(len(tensor_sizes)-2)):
         # Launch the add_block_sums_wrapper
         libsegcumsum.add_block_sums_wrapper(
             ctypes.c_void_p(output_tensors[i].data_ptr()),
@@ -122,6 +133,8 @@ def segcumsum(input_tensor, segment_ids, max_seg_size=None):
 
         # Synchronize to ensure the final result is ready
         torch.cuda.synchronize()
+
+        # assert output_tensors[i][0] != 2
 
     return output_tensors[0]
 

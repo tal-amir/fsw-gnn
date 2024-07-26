@@ -4,10 +4,11 @@
 # Technion Institute of Technology
 # Haifa, Israel
 
-version = '1.30'
-version_date = '2024-07-25'
+version = '1.31b'
+version_date = '2024-07-26'
 
 # Changelog:
+# 1.31b   Reverted to correct & slow sparse cumsum due to bug in the new segcumsum
 # 1.31a   Testing hierarchical segcumsum
 # 1.30    Added CUDA-implemented segcumsum, still slow
 # 1.29    Added CUDA-implemented segcumsum!
@@ -53,6 +54,8 @@ sw_embedding_debug_mode = False
 # - Ensure that all multisets/distributions represented by W have a positive total mass (i.e. not zero total mass or empty multisets)
 sw_embedding_basic_safety_checks = True
 
+# Tells whether to use a version of sparse cumsum that is known to be correct. Use this only for debugging purposes.
+sw_embedding_use_slow_sparse_cumsum = True
 
 ''' Maps multisets in R^d to vectors in R^m using the Sliced-Wasserstrin Embedding.
     Also supports weighted point-clouds in R^d, which are regarded as discrete distributions over R^d.
@@ -1084,7 +1087,7 @@ class ag:
                     # Restore original size as before sum()
                     for i in broadcast_dims:
                         out_B = out_B.unsqueeze(dim=int(i))
-                    
+
                     out_B = out_B.to_dense()
                 else:
                     # Note that if B didn't need to be broadcast, this size is not huge
@@ -1310,8 +1313,11 @@ class ag:
             assert X.is_coalesced(), 'X must be coalesced'
 
             ctx.dim = dim if dim >= 0 else ( dim + X.dim() )
-            #return sp.sparse_cumsum(X, dim=ctx.dim)
-            return sp.sparse_cumsum_alt1(X, dim=ctx.dim)
+
+            if sw_embedding_use_slow_sparse_cumsum:
+                return sp.sparse_cumsum(X, dim=ctx.dim)
+            else:
+                return sp.sparse_cumsum_alt1(X, dim=ctx.dim)
 
         @staticmethod
         @once_differentiable
@@ -1320,8 +1326,12 @@ class ag:
 
             if ctx.needs_input_grad[0]:
                 G = sp.sparse_flip(grad_output, dim=dim)
-                #G = sp.sparse_cumsum(G, dim=dim)
-                G = sp.sparse_cumsum_alt1(G, dim=dim)
+
+                if sw_embedding_use_slow_sparse_cumsum:
+                    G = sp.sparse_cumsum(G, dim=dim)
+                else:
+                    G = sp.sparse_cumsum_alt1(G, dim=dim)
+
                 grad_input = sp.sparse_flip(G, dim=dim)
             else:
                 grad_input = None
@@ -1532,7 +1542,7 @@ class sp:
 
         perm_inv = torch.argsort(sort_inds, dim=0)
         del sort_inds
-        
+
         vals_out = vals_sorted_cumsum[perm_inv]
         
         # Create a new sparse tensor with cumulative sum values

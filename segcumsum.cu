@@ -1,6 +1,11 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 
+// TODO: 
+// 1. Check whether to index with int or longint
+// 2. Add support for float64, float16, float8
+// 3. Look at the call to .sum(dim=something) on a sparse matrix
+
 #define CHECK_CUDA_ERROR(call) {                                \
     const cudaError_t error = call;                             \
     if (error != cudaSuccess) {                                 \
@@ -77,10 +82,18 @@ extern "C" __global__ void add_block_sums_kernel(float* output, const float* blo
     int index = blockIdx.x * blockDim.x + tid;
     int id_curr = segment_ids[index];
 
+    // if ((blockIdx.x >= 1))
+    //     output[index] = 2.0;
+
+    // if (block_last_id[blockIdx.x-1] != 8.0)
+    // {
+    //     if (index == 0)
+    //         output[index] = 16.0;
+    // }
+    
+    // TODO: This is the real code
     if ((blockIdx.x >= 1) && (block_last_id[blockIdx.x-1] == id_curr))
-    {
         output[index] += block_sums[blockIdx.x-1];
-    }
 }
 
 extern "C" void segcumsum_wrapper(float* values, const int* segment_ids, int size, int max_seg_size, float* block_sums_out, int* block_last_ids_out, bool return_next_level, int blocks, int threads_per_block, size_t shared_memory_size) {
