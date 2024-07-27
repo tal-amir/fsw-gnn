@@ -8,6 +8,7 @@ version = '1.4'
 version_date = '2024-07-28'
 
 # Changelog:
+# 1.41    Added reverse option to sparse_cumsum
 # 1.4     Incorporated segcumsum
 # 1.31b   Reverted to correct & slow sparse cumsum due to bug in the new segcumsum
 # 1.31a   Testing hierarchical segcumsum
@@ -54,9 +55,6 @@ sw_embedding_debug_mode = False
 # - Ensure that X and W do not contain infs and nans, and W only contains nonnegative values
 # - Ensure that all multisets/distributions represented by W have a positive total mass (i.e. not zero total mass or empty multisets)
 sw_embedding_basic_safety_checks = True
-
-# Tells whether to use a version of sparse cumsum that is known to be correct. Use this only for debugging purposes.
-sw_embedding_use_slow_sparse_cumsum = False
 
 # Tells whether to use float64 in numerically-challenging parts of the code even if the data is in float32 format.
 # This was not observed to increase accuracy, and it incurs a significantly narrower memory bottleneck and a slightly higher running time.
@@ -1316,13 +1314,9 @@ class ag:
         @staticmethod
         def forward(ctx, X, dim):
             assert X.is_coalesced(), 'X must be coalesced'
-
             ctx.dim = dim if dim >= 0 else ( dim + X.dim() )
+            return sp.sparse_cumsum(X, dim=ctx.dim)
 
-            if sw_embedding_use_slow_sparse_cumsum:
-                return sp.sparse_cumsum(X, dim=ctx.dim)
-            else:
-                return sp.sparse_cumsum_alt1(X, dim=ctx.dim)
 
         @staticmethod
         @once_differentiable
@@ -1330,14 +1324,7 @@ class ag:
             dim = ctx.dim
 
             if ctx.needs_input_grad[0]:
-                G = sp.sparse_flip(grad_output, dim=dim)
-
-                if sw_embedding_use_slow_sparse_cumsum:
-                    G = sp.sparse_cumsum(G, dim=dim)
-                else:
-                    G = sp.sparse_cumsum_alt1(G, dim=dim)
-
-                grad_input = sp.sparse_flip(G, dim=dim)
+                grad_input = sp.sparse_cumsum(grad_output, dim=dim, reverse=True) 
             else:
                 grad_input = None
 
@@ -1509,7 +1496,7 @@ class sp:
         return sp.sparse_coo_tensor_coalesced(indices=inds, values=out_vals, size=A.shape)
 
 
-    def sparse_cumsum_alt1(A, dim):
+    def sparse_cumsum(A, dim, reverse=False):
         # Ensure the input is a sparse tensor
         if not A.is_sparse:
             raise ValueError("Input tensor must be a sparse tensor.")
@@ -1533,22 +1520,28 @@ class sp:
         # Get the unique keys for the other dimensions
         keys = sp.ravel_index(inds[dims2,:], shape2)
 
-        # print('dims2: ', dims2)
-        # print('shape: ', shape)
-        # print('shape2: ', shape2)
-        # print('keys shape:', keys.shape)
+        # segcumsum below only takes int32 ids as inputs
+        # we convert keys already over here since sorting int32 is likely faster than int64
+        # TODO: Add code here that verifies we do not truncate large integers
+        keys = keys.to(torch.int32)
 
         # Sort the keys and get the counts of each unique key
-        keys_sorted, sort_inds = torch.sort(keys, dim=0, stable=True)
-        del keys
+        if not reverse:
+            keys_sorted, sort_inds = torch.sort(keys, dim=0, stable=True)
+            del keys
+        else:
+            _, sort_inds = torch.sort(keys, dim=0, stable=True)
+            del _
+            sort_inds = torch.flip(sort_inds, [0,])
+            keys_sorted = keys[sort_inds]
+            del keys
 
-        # segcumsum below only takes int32 ids as inputs
-        # TODO: Add code here that verifies we do not truncate large integers
-        keys_sorted = keys_sorted.to(torch.int32)
 
         # Sort the values according to the keys, to form contiguous segments
         vals_sorted = vals[sort_inds]
         
+        # TODO: Calculate the maximal vertex degree somewhere earlier in the code from W, and pass max_seg_size to segcumsum
+        #       explicitly to improve the memory bottleneck
         if (vals_sorted.dtype != torch.float64) and sw_embedding_high_precision:
             dtype_orig = vals_sorted.dtype
             vals_sorted = vals_sorted.to(torch.float64)
@@ -1573,133 +1566,6 @@ class sp:
         
         return out
         
-    
-    def sparse_cumsum(A, dim):
-        assert A.is_sparse, 'A must be sparse'
-        assert not torch.is_grad_enabled(), 'This function can only be called within torch.no_grad(), as it is not meant to calculate gradients.'
-
-        dim = dim if dim >= 0 else ( dim + A.dim() )
-
-        if dim != A.dim()- 1:
-            #print('A device: %s  A mmz: %d' % (A.device, A.values().numel()))
-
-            # Two equivalent implementations. The first is clearer, the second is more memory-efficient.
-            if False:
-                return sp.sparse_cumsum(  A.transpose(-1,dim).coalesce()  ,  -1).transpose(-1,dim).coalesce()
-            else:
-                A = A.transpose(-1,dim)
-                A = sp.coalesce_unique(A)
-                out = sp.sparse_cumsum(A, -1)
-                del A
-                out = out.transpose(-1,dim)
-                out = sp.coalesce_unique(out)
-
-            return out
-
-        assert A.is_coalesced(), 'A must be coalesced'
-
-        # Note: We convert here to float64 because on float32 the numerical error is accumulated over the whole of A and can be quite high
-        # when working with float32 (rel. err ~1e-3).
-        # TODO: We will not need this conversion when torch adds support for cumsum with a reset mask, 
-        #       or a designated cumsum for sparse matrices.
-        #       On top of the high loss of significant digits, this function is also a memory bottleneck.
-        #       Better replace it as soon as possible.
-
-        A_shape = A.shape
-
-        orig_dtype = A.dtype
-        A = A.to(dtype=torch.float64)
-
-        # Variant 1 is simpler to read.
-        # Not sure which of the two is faster or more memory efficient.
-        # Possibly variant 1 since it avoids coalesce.
-        variant = 1 
-
-        if variant == 1:
-            sums = A.sum(dim=-1)
-            assert_coalesced(sums)
-            sums = sums = ag.unsqueeze_sparse.apply(sums,-1)
-
-        elif variant == 2:
-            sums_shape = list(A.shape)
-            sums_shape = sums_shape[0:-1]
-            sums_shape = tuple(sums_shape)
-
-            # Indices are not coalesced            
-            sums = torch.sparse_coo_tensor(indices=A.indices()[0:-1, :], values=A.values(), size=sums_shape)
-            sums = sums.coalesce()
-
-            sums = ag.unsqueeze_sparse.apply(sums,-1)            
-
-        elif variant == 3:
-            # If we had a good function for sparse tensor multiplication across arbitrary dimension, we could calculate
-            # sums by multiplying A with a vector of ones. Not sure if it would be better than variant 1 though.
-            pass
-
-        
-        else:
-            raise RuntimeError('This should not happen')
-
-        # Variant 1 is the simplest to read, but it requires more memory
-        # Variant 2 is more memory efficient; it is similar to variant 1, but avoids coalesce
-        #   Note that it makes use of the PyTorch's internal functions _indices() and _values()
-        # Variant 3 is the most low-level method. Not sure if it is better than 2.
-        variant = 2   # preferable is no. 2, unless something goes wrong due to using _indices() and _values().
-                      # in this case, no. 3 is preferable.
-
-        if variant == 1:
-            A_walled = torch.cat((A, -sums), dim=-1)
-            del A, sums
-            A_walled = A_walled.coalesce()
-
-        elif variant == 2:
-            A_walled = torch.cat((A, -sums), dim=-1)
-            del A, sums
-            inds2, vals2 = sp.sort_inds_vals(A_walled._indices(), A_walled._values(), shape=A_walled.shape, ensure_unique=True)
-            walled_shape = A_walled.shape
-            del A_walled
-            A_walled = sp.sparse_coo_tensor_coalesced(indices=inds2, values=vals2, size=walled_shape)
-
-        elif variant == 3:
-            sums_inds = sums.indices()
-            sums_inds[-1,:] += A.shape[-1]
-            sums_values = sums.values()
-            del sums
-
-            inds_walled = torch.cat( (A.indices(), sums_inds), dim=1)                
-            inds_walled[len(A.indices()):, -1] = A.shape[-1]
-            del sums_inds
-
-            vals_walled = torch.cat( (A.values(), -sums_values), dim=0)
-            del sums_values
-
-            walled_shape = list(A.shape)
-            walled_shape[-1] = walled_shape[-1]+1
-            walled_shape = tuple(walled_shape)
-
-            # Indices are not coalesced
-            inds2, vals2 = sp.sort_inds_vals(inds_walled, vals_walled, shape=walled_shape, ensure_unique=True)
-            del A, inds_walled, vals_walled
-            A_walled = sp.sparse_coo_tensor_coalesced(indices=inds2, values=vals2, size=walled_shape)
-            del inds2, vals2
-
-        else:
-            raise RuntimeError('This should not happen')
-
-        inds = A_walled.indices()
-        vals = A_walled.values().cumsum(dim=0)
-        del A_walled
-
-        subset = (inds[-1,:] < A_shape[-1])
-
-        out = sp.sparse_coo_tensor_coalesced(indices=inds[:,subset], values=vals[subset], size=A_shape)
-        del inds, vals, subset
-
-        out = out.to(dtype=orig_dtype)
-        assert_coalesced(out)
-
-        return out
-
 
     def sparse_flip(A, dim):
         assert not torch.is_grad_enabled(), 'This function can only be called within torch.no_grad(), as it is not meant to calculate gradients.'
