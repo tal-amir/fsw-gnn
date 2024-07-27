@@ -4,10 +4,11 @@
 # Technion Institute of Technology
 # Haifa, Israel
 
-version = '1.31b'
-version_date = '2024-07-26'
+version = '1.4'
+version_date = '2024-07-28'
 
 # Changelog:
+# 1.4     Incorporated segcumsum
 # 1.31b   Reverted to correct & slow sparse cumsum due to bug in the new segcumsum
 # 1.31a   Testing hierarchical segcumsum
 # 1.30    Added CUDA-implemented segcumsum, still slow
@@ -37,7 +38,7 @@ from torch.autograd.function import once_differentiable
 
 import warnings
 import numbers
-import type_enforced # A runtime error in this line implies that that some function below is given an input arguemnt of the wrong type
+import type_enforced # Note: A runtime error in this line implies that that some function below is given an input arguemnt of the wrong type
 
 import time
 
@@ -45,7 +46,7 @@ from segcumsum import segcumsum
 
 # Turn this on to run some verifications and sanity checks during runtime.
 # If an error is encountered, a runtime error is raised
-sw_embedding_debug_mode = False
+sw_embedding_debug_mode = True
 
 # Conduct basic safety checks, mainly on the user input.
 # Recommended to leave True, unless running time is of utmost importance, and the input is known to be consistent.
@@ -55,7 +56,11 @@ sw_embedding_debug_mode = False
 sw_embedding_basic_safety_checks = True
 
 # Tells whether to use a version of sparse cumsum that is known to be correct. Use this only for debugging purposes.
-sw_embedding_use_slow_sparse_cumsum = True
+sw_embedding_use_slow_sparse_cumsum = False
+
+# Tells whether to use float64 in numerically-challenging parts of the code even if the data is in float32 format.
+# This was not observed to increase accuracy, and it incurs a significantly narrower memory bottleneck and a slightly higher running time.
+sw_embedding_high_precision = False
 
 ''' Maps multisets in R^d to vectors in R^m using the Sliced-Wasserstrin Embedding.
     Also supports weighted point-clouds in R^d, which are regarded as discrete distributions over R^d.
@@ -1514,10 +1519,12 @@ class sp:
         
         inds = A.indices()
         vals = A.values()
-        
+
         # Shape of the sparse tensor
         shape = list(A.shape)
-        
+
+        assert (dim >= 0) and (dim < inds.shape[0])
+
         # Get the other dimensions excluding the one we're summing over,
         # and get the shape along these dimensions.
         dims2 = [d for d in range(len(shape)) if d != dim]
@@ -1526,22 +1533,38 @@ class sp:
         # Get the unique keys for the other dimensions
         keys = sp.ravel_index(inds[dims2,:], shape2)
 
+        # print('dims2: ', dims2)
+        # print('shape: ', shape)
+        # print('shape2: ', shape2)
+        # print('keys shape:', keys.shape)
+
         # Sort the keys and get the counts of each unique key
         keys_sorted, sort_inds = torch.sort(keys, dim=0, stable=True)
         del keys
 
-        _, counts = torch.unique_consecutive(keys_sorted, return_counts=True)
-        max_seg_size = torch.max(counts)
-        del counts
+        # segcumsum below only takes int32 ids as inputs
+        # TODO: Add code here that verifies we do not truncate large integers
+        keys_sorted = keys_sorted.to(torch.int32)
 
         # Sort the values according to the keys, to form contiguous segments
         vals_sorted = vals[sort_inds]
-
-        vals_sorted_cumsum = segcumsum(vals_sorted, keys_sorted, max_seg_size)
-        del vals_sorted
+        
+        if (vals_sorted.dtype != torch.float64) and sw_embedding_high_precision:
+            dtype_orig = vals_sorted.dtype
+            vals_sorted = vals_sorted.to(torch.float64)
+            vals_sorted_cumsum = segcumsum(vals_sorted, keys_sorted, in_place=True, thorough_verify_input=sw_embedding_debug_mode)
+            del vals_sorted
+            vals_sorted_cumsum = vals_sorted_cumsum.to(dtype_orig)
+        else:
+            # TODO: Verify that this in-place action on vals_sorted does not destroy the original A
+            vals_sorted_cumsum = segcumsum(vals_sorted, keys_sorted, in_place=True, thorough_verify_input=sw_embedding_debug_mode)
+            del vals_sorted
 
         perm_inv = torch.argsort(sort_inds, dim=0)
         del sort_inds
+
+        #out = torch.sparse_coo_tensor(indices=inds[:,sort_inds], values=vals_sorted_cumsum).coalesce()
+        #return out
 
         vals_out = vals_sorted_cumsum[perm_inv]
         
@@ -1690,6 +1713,9 @@ class sp:
 
         inds2, vals2 = sp.sort_inds_vals(inds, vals, shape=A.shape, ensure_unique=True)
         out = sp.sparse_coo_tensor_coalesced(indices=inds2, values=vals2, size=A.shape)
+
+        # Probably slower alternative:
+        # out = torch.sparse_coo_tensor(indices=inds, values=vals, size=A.shape).coalesce()
 
         return out
 
