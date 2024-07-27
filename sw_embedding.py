@@ -1471,7 +1471,7 @@ class sp:
         if debug:
             assert ( len(torch.unique(inds1d)) == len(inds1d) ), 'indices are not unique'
 
-        _, sort_perm = torch.sort(inds1d)
+        sort_perm = torch.argsort(inds1d)
         del inds1d
 
         return (indices[:,sort_perm], values[sort_perm])
