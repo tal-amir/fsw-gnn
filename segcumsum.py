@@ -58,6 +58,7 @@ def segcumsum(values, segment_ids, max_seg_size=None, in_place=False, thorough_v
     if max_seg_size is None:
         # Calculate maximal segmet size
         _, counts_consecutive = torch.unique_consecutive(segment_ids, return_counts=True)
+        del _
         num_segments = counts_consecutive.numel()
         max_seg_size_real = int(torch.max(counts_consecutive))
         max_seg_size = max_seg_size_real
@@ -69,11 +70,13 @@ def segcumsum(values, segment_ids, max_seg_size=None, in_place=False, thorough_v
     if thorough_verify_input:
         if num_segments is None:
             _, counts_consecutive = torch.unique_consecutive(segment_ids, return_counts=True)
+            del _
             num_segments = counts_consecutive.numel()
             max_seg_size_real = int(torch.max(counts_consecutive))
             del counts_consecutive
 
         _, counts_total = torch.unique(segment_ids, return_counts=True)
+        del _
         num_segments_unique = counts_total.numel()
         del counts_total
 
