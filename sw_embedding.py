@@ -1530,8 +1530,7 @@ class sp:
             keys_sorted, sort_inds = torch.sort(keys, dim=0, stable=True)
             del keys
         else:
-            _, sort_inds = torch.sort(keys, dim=0, stable=True)
-            del _
+            sort_inds = torch.argsort(keys, dim=0, stable=True)
             sort_inds = torch.flip(sort_inds, [0,])
             keys_sorted = keys[sort_inds]
             del keys
