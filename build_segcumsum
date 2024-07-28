@@ -1,0 +1,12 @@
+#! /bin/bash
+nvcc -shared -o libsegcumsum.so -O3 --compiler-options '-O3 -fPIC' segcumsum.cu -I/home/talamir/.miniconda3/envs/swembedding/lib/python3.12/site-packages/nvidia/cuda_runtime/include -L/usr/local/cuda/targets/x86_64-linux/lib \
+    -gencode arch=compute_50,code=sm_50 \
+    -gencode arch=compute_52,code=sm_52 \
+    -gencode arch=compute_60,code=sm_60 \
+    -gencode arch=compute_61,code=sm_61 \
+    -gencode arch=compute_70,code=sm_70 \
+    -gencode arch=compute_75,code=sm_75 \
+    -gencode arch=compute_80,code=sm_80 \
+    -gencode arch=compute_86,code=sm_86
+
+
