@@ -21,8 +21,10 @@ import ctypes
 import os
 import numbers
 
-# Load the segcumsum shared library
-libsegcumsum = ctypes.CDLL(os.path.abspath("libsegcumsum.so"))
+# Load the segcumsum shared library from the same directory as the current file
+mydir = os.path.dirname(os.path.abspath(__file__))
+libsegcumsum_path = os.path.join(mydir, "libsegcumsum.so")
+libsegcumsum = ctypes.CDLL(libsegcumsum_path)
 
 
 # This is the main function that calculates the segmented cumsum.
@@ -124,9 +126,11 @@ def segcumsum_cuda(values, segment_ids, max_seg_size, in_place):
     # Set to an arbitrarily large number (e.g. 1e6) to determine automatically.
     max_num_threads_per_block = 1e6
 
+    print('dtype = ', segment_ids.dtype)
+
     assert values.device.type == 'cuda', 'the tensor ''values'' must be on a CUDA device'
     assert segment_ids.device.type == 'cuda', 'the tensor ''segment_ids'' must be on a CUDA device'
-    assert segment_ids.dtype == torch.int32, 'segment_ids must have int32 dtype'
+    assert segment_ids.dtype == torch.int64, 'segment_ids must have int64 dtype'
     
     # Process input data types
     if values.dtype == torch.float32:
@@ -189,29 +193,29 @@ def segcumsum_cuda(values, segment_ids, max_seg_size, in_place):
 
     # Define the kernel signatures
     libsegcumsum.segcumsum_wrapper.argtypes = [
-        ctypes.c_int,     # dtype_num
+        ctypes.c_int64,     # dtype_num
         ctypes.c_void_p,  # values input/output pointer
         ctypes.c_void_p,  # segment_ids pointer
-        ctypes.c_int,     # size
-        ctypes.c_int,     # max_seg_size
+        ctypes.c_int64,     # size
+        ctypes.c_int64,     # max_seg_size
         ctypes.c_void_p,  # block sums output pointer
         ctypes.c_void_p,  # block last ids output pointer
         ctypes.c_bool,    # return_next_level boolean
-        ctypes.c_int,     # blocks
-        ctypes.c_int,     # threads_per_block
+        ctypes.c_int64,     # blocks
+        ctypes.c_int64,     # threads_per_block
         ctypes.c_size_t   # shared_memory_size
     ]
     libsegcumsum.segcumsum_wrapper.restype = None
 
     libsegcumsum.add_block_sums_wrapper.argtypes = [
-        ctypes.c_int,     # dtype_num
+        ctypes.c_int64,     # dtype_num
         ctypes.c_void_p,  # output pointer
         ctypes.c_void_p,  # block_sums pointer
         ctypes.c_void_p,  # segment_ids pointer
         ctypes.c_void_p,  # block_last_id pointer
-        ctypes.c_int,     # size
-        ctypes.c_int,     # blocks
-        ctypes.c_int      # threads_per_block
+        ctypes.c_int64,     # size
+        ctypes.c_int64,     # blocks
+        ctypes.c_int64      # threads_per_block
     ]
     libsegcumsum.add_block_sums_wrapper.restype = None
 
@@ -220,16 +224,16 @@ def segcumsum_cuda(values, segment_ids, max_seg_size, in_place):
 
         # Launch the segcumsum_wrapper
         libsegcumsum.segcumsum_wrapper(
-            ctypes.c_int(dtype_num),
+            ctypes.c_int64(dtype_num),
             ctypes.c_void_p(output_tensors[i].data_ptr()),
             ctypes.c_void_p(id_tensors[i].data_ptr()),
-            ctypes.c_int(tensor_sizes[i]),            
-            ctypes.c_int(max_seg_sizes[i]),
+            ctypes.c_int64(tensor_sizes[i]),            
+            ctypes.c_int64(max_seg_sizes[i]),
             ctypes.c_void_p(output_tensors[i+1].data_ptr() if return_next_level else 0),
             ctypes.c_void_p(id_tensors[i+1].data_ptr() if return_next_level else 0),
             ctypes.c_bool( return_next_level  ),
-            ctypes.c_int(num_blocks[i]),
-            ctypes.c_int(threads_per_block),
+            ctypes.c_int64(num_blocks[i]),
+            ctypes.c_int64(threads_per_block),
             ctypes.c_size_t(shared_memory_size)
         )
 
@@ -238,14 +242,14 @@ def segcumsum_cuda(values, segment_ids, max_seg_size, in_place):
 
         # Launch the add_block_sums_wrapper
         libsegcumsum.add_block_sums_wrapper(
-            ctypes.c_int(dtype_num),
+            ctypes.c_int64(dtype_num),
             ctypes.c_void_p(output_tensors[i].data_ptr()),
             ctypes.c_void_p(output_tensors[i+1].data_ptr()),
             ctypes.c_void_p(id_tensors[i].data_ptr()),
             ctypes.c_void_p(id_tensors[i+1].data_ptr()),
-            ctypes.c_int(tensor_sizes[i]),
-            ctypes.c_int(num_blocks[i]),
-            ctypes.c_int(threads_per_block)
+            ctypes.c_int64(tensor_sizes[i]),
+            ctypes.c_int64(num_blocks[i]),
+            ctypes.c_int64(threads_per_block)
         )
 
     return output_tensors[0]

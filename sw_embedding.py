@@ -4,10 +4,11 @@
 # Technion Institute of Technology
 # Haifa, Israel
 
-version = '1.43a'
+version = '1.44'
 version_date = '2024-07-28'
 
 # Changelog:
+# 1.44    Added end-to-end support for int64 indexing
 # 1.43a   Testing the computation time of sum(A,dim=0) when A is sparse
 # 1.42    More memory-efficient sparse_cumsum backward()
 # 1.41    Added reverse option to sparse_cumsum
@@ -42,14 +43,21 @@ from torch.autograd.function import once_differentiable
 import warnings
 import numbers
 import type_enforced # Note: A runtime error in this line implies that that some function below is given an input arguemnt of the wrong type
+import importlib.util
 
+import os
 import time
 
-from segcumsum import segcumsum
+# Load the segcumsum module from the same directory as the current file
+mydir = os.path.dirname(os.path.abspath(__file__))
+segcumsum_spec = importlib.util.spec_from_file_location('segcumsum', os.path.join(mydir, 'segcumsum.py'))
+segcumsum_module = importlib.util.module_from_spec(segcumsum_spec)
+segcumsum_spec.loader.exec_module(segcumsum_module)
+segcumsum = getattr(segcumsum_module, 'segcumsum')
 
 # Turn this on to run some verifications and sanity checks during runtime.
 # If an error is encountered, a runtime error is raised
-sw_embedding_debug_mode = True
+sw_embedding_debug_mode = False
 
 # Conduct basic safety checks, mainly on the user input.
 # Recommended to leave True, unless running time is of utmost importance, and the input is known to be consistent.
@@ -501,10 +509,6 @@ class SW_embedding(nn.Module):
             #       Currently there is no is_dense() function in torch, so reading the layout string directly is the 2nd best.
             if W.is_sparse or W.layout != torch.strided:
                 assert W.layout == torch.sparse_coo, ( "Sparse W has an unsupported sparsity layout '%s'. Only the COO layout (torch.sparse_coo) is currently supported." % (W.layout) )
-
-                # TODO: Add int64 indexing support
-                int32_max = torch.iinfo(torch.int32).max
-                assert W.numel() <= int32_max, 'currently sparse W is only supported when W.numel() <= maximal int32 (2147483647)'
 
                 assert W.is_coalesced(), 'Sparse W must be coalesced'
 
@@ -1465,12 +1469,7 @@ class sp:
         weights = shape.reshape([nd,1]).flip(dims=(0,))[0:-1].cumprod(dim=0).flip(dims=(0,))
         weights = torch.cat((weights, torch.ones(size=(1,1), device=weights.device, dtype=weights.dtype)), dim=0)
 
-        #out = torch.sum(indices*weights, dim=0) 
-        out = torch.sum(indices.to(torch.int32)*weights.to(torch.int32), dim=0, dtype=torch.int32)
-
-        if sw_embedding_debug_mode:
-            out_true = torch.sum(indices*weights, dim=0) 
-            assert ( out.to(out_true.dtype) == out ).all(), 'int32 truncation error. input tensor size is larger than torch.iinfo(torch.int32).max'
+        out = torch.sum(indices*weights, dim=0) 
 
         return out
 
@@ -1540,8 +1539,6 @@ class sp:
         
         # Get the unique keys for the other dimensions
         keys = sp.ravel_index(inds[dims2,:], tuple(shape2))
-
-        # segcumsum below only takes int32 ids as inputs
 
         # Sort the keys and get the counts of each unique key
         if not reverse:

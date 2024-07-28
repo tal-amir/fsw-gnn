@@ -32,16 +32,16 @@ enum class torch_dtype {
 // =================================================================================================
 
 template <typename numtype>
-__global__ void segcumsum_kernel(numtype* values, const int* segment_ids, int size, int max_seg_size, numtype* block_sums_out, int* block_last_ids_out, bool return_next_level) {
+__global__ void segcumsum_kernel(numtype* values, const int64_t* segment_ids, int64_t size, int64_t max_seg_size, numtype* block_sums_out, int64_t* block_last_ids_out, bool return_next_level) {
 
     extern __shared__ char shared_mem[]; // Unnamed extern shared memory
     numtype* shared_data = reinterpret_cast<numtype*>(shared_mem); // Cast to appropriate type
 
-    int tid = threadIdx.x;
-    int index = blockIdx.x * blockDim.x + tid;
+    int64_t tid = threadIdx.x;
+    int64_t index = blockIdx.x * blockDim.x + tid;
     bool ok = (index < size);
 
-    int id_curr;    
+    int64_t id_curr;    
 
     // Load input into shared memory
     if (ok) {
@@ -53,19 +53,19 @@ __global__ void segcumsum_kernel(numtype* values, const int* segment_ids, int si
     __syncthreads();
 
     // Inclusive scan (cumulative sum) within each block
-    int stride_limit = min(max_seg_size, blockDim.x);
+    int64_t stride_limit = min(max_seg_size, (int64_t)blockDim.x);
 
     bool stop = false;
     
     // if not ok, the loop will not run
-    for (int stride = 1; stride < stride_limit; stride *= 2) {
+    for (int64_t stride = 1; stride < stride_limit; stride *= 2) {
         numtype temp;
         if ((!ok) || (stop) || (stride > tid)) {
             temp = 0.0;
         }
         else
         {            
-            int id_lookback = segment_ids[index-stride];
+            int64_t id_lookback = segment_ids[index-stride];
             if (id_curr != id_lookback)
             {
                 temp = 0.0;                
@@ -100,13 +100,13 @@ __global__ void segcumsum_kernel(numtype* values, const int* segment_ids, int si
 
 
 template <typename numtype>
-__global__ void add_block_sums_kernel(numtype* output, const numtype* block_sums, const int* segment_ids, const int* block_last_id, int size) {
+__global__ void add_block_sums_kernel(numtype* output, const numtype* block_sums, const int64_t* segment_ids, const int64_t* block_last_id, int64_t size) {
 
-    int tid = threadIdx.x;
-    int index = blockIdx.x * blockDim.x + tid;
+    int64_t tid = threadIdx.x;
+    int64_t index = blockIdx.x * blockDim.x + tid;
     bool ok = (index < size);
 
-    int id_curr;
+    int64_t id_curr;
 
     if (ok)
         id_curr = segment_ids[index];
@@ -124,15 +124,15 @@ __global__ void add_block_sums_kernel(numtype* output, const numtype* block_sums
 extern "C" {
     void launch_segcumsum_kernel_float(
         float* values,
-        const int* segment_ids,
-        int size,
-        int max_seg_size,
+        const int64_t* segment_ids,
+        int64_t size,
+        int64_t max_seg_size,
         float* block_sums_out,
-        int* block_last_ids_out,
+        int64_t* block_last_ids_out,
         bool return_next_level,
-        int num_blocks,
-        int threads_per_block,
-        int shared_memory_size
+        int64_t num_blocks,
+        int64_t threads_per_block,
+        int64_t shared_memory_size
     ) {
         segcumsum_kernel<<<num_blocks, threads_per_block, shared_memory_size>>>(
             values, segment_ids, size, max_seg_size, block_sums_out, block_last_ids_out, return_next_level
@@ -141,15 +141,15 @@ extern "C" {
 
     void launch_segcumsum_kernel_double(
         double* values,
-        const int* segment_ids,
-        int size,
-        int max_seg_size,
+        const int64_t* segment_ids,
+        int64_t size,
+        int64_t max_seg_size,
         double* block_sums_out,
-        int* block_last_ids_out,
+        int64_t* block_last_ids_out,
         bool return_next_level,
-        int num_blocks,
-        int threads_per_block,
-        int shared_memory_size
+        int64_t num_blocks,
+        int64_t threads_per_block,
+        int64_t shared_memory_size
     ) {
         segcumsum_kernel<<<num_blocks, threads_per_block, shared_memory_size>>>(
             values, segment_ids, size, max_seg_size, block_sums_out, block_last_ids_out, return_next_level
@@ -159,11 +159,11 @@ extern "C" {
     void launch_add_block_sums_kernel_float(
         float* output,
         const float* block_sums,
-        const int* segment_ids, 
-        const int* block_last_id, 
-        int size,
-        int num_blocks,
-        int threads_per_block
+        const int64_t* segment_ids, 
+        const int64_t* block_last_id, 
+        int64_t size,
+        int64_t num_blocks,
+        int64_t threads_per_block
     ) {
         add_block_sums_kernel<<<num_blocks, threads_per_block>>>(output, block_sums, segment_ids, block_last_id, size);
         CHECK_CUDA_ERROR(cudaGetLastError());
@@ -172,11 +172,11 @@ extern "C" {
     void launch_add_block_sums_kernel_double(
         double* output,
         const double* block_sums,
-        const int* segment_ids, 
-        const int* block_last_id, 
-        int size,
-        int num_blocks,
-        int threads_per_block
+        const int64_t* segment_ids, 
+        const int64_t* block_last_id, 
+        int64_t size,
+        int64_t num_blocks,
+        int64_t threads_per_block
     ) {
         add_block_sums_kernel<<<num_blocks, threads_per_block>>>(output, block_sums, segment_ids, block_last_id, size);
         CHECK_CUDA_ERROR(cudaGetLastError());
@@ -191,7 +191,7 @@ extern "C" {
 // ========================== Wrapper functions to be called from Python ===========================
 // =================================================================================================
 
-extern "C" void segcumsum_wrapper(torch_dtype dtype, void* values, const int* segment_ids, int size, int max_seg_size, void* block_sums_out, int* block_last_ids_out, bool return_next_level, int num_blocks, int threads_per_block, size_t shared_memory_size) {
+extern "C" void segcumsum_wrapper(torch_dtype dtype, void* values, const int64_t* segment_ids, int64_t size, int64_t max_seg_size, void* block_sums_out, int64_t* block_last_ids_out, bool return_next_level, int64_t num_blocks, int64_t threads_per_block, size_t shared_memory_size) {
     // segcumsum_kernel<<<num_blocks, threads_per_block, shared_memory_size>>>(values, segment_ids, size, max_seg_size, block_sums_out, block_last_ids_out, return_next_level);
 
     CHECK_CUDA_ERROR(cudaDeviceSynchronize());
@@ -209,7 +209,7 @@ extern "C" void segcumsum_wrapper(torch_dtype dtype, void* values, const int* se
 }
 
 
-extern "C" void add_block_sums_wrapper(torch_dtype dtype, void* output, const void* block_sums, const int* segment_ids, const int* block_last_id, int size, int num_blocks, int threads_per_block) {
+extern "C" void add_block_sums_wrapper(torch_dtype dtype, void* output, const void* block_sums, const int64_t* segment_ids, const int64_t* block_last_id, int64_t size, int64_t num_blocks, int64_t threads_per_block) {
     //add_block_sums_kernel<<<num_blocks, threads_per_block>>>(output, block_sums, segment_ids, block_last_id, size);
 
     CHECK_CUDA_ERROR(cudaDeviceSynchronize());
