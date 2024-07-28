@@ -4,10 +4,11 @@
 # Technion Institute of Technology
 # Haifa, Israel
 
-version = '1.4'
+version = '1.42'
 version_date = '2024-07-28'
 
 # Changelog:
+# 1.42    More memory-efficient sparse_cumsum backward()
 # 1.41    Added reverse option to sparse_cumsum
 # 1.4     Incorporated segcumsum
 # 1.31b   Reverted to correct & slow sparse cumsum due to bug in the new segcumsum
@@ -47,13 +48,11 @@ from segcumsum import segcumsum
 
 # Turn this on to run some verifications and sanity checks during runtime.
 # If an error is encountered, a runtime error is raised
-sw_embedding_debug_mode = False
+sw_embedding_debug_mode = True
 
 # Conduct basic safety checks, mainly on the user input.
 # Recommended to leave True, unless running time is of utmost importance, and the input is known to be consistent.
-# Examples of safety checks:
-# - Ensure that X and W do not contain infs and nans, and W only contains nonnegative values
-# - Ensure that all multisets/distributions represented by W have a positive total mass (i.e. not zero total mass or empty multisets)
+# Setting this to False does not significantly reduce running time.
 sw_embedding_basic_safety_checks = True
 
 # Tells whether to use float64 in numerically-challenging parts of the code even if the data is in float32 format.
@@ -517,7 +516,6 @@ class SW_embedding(nn.Module):
                 assert not torch.isnan(W_vals).any(), "W cannot contain NaNs"
                 assert not torch.isinf(W_vals).any(), "All entries of W must be finite"
                 assert (W_vals >= 0).all(), "All entries of W must be nonnegative"
-                assert (W_vals > 0).any(dim=-1).all(), "W assigns an all-zero weight to one of its distributions"
 
                 if W.requires_grad and (W_vals == 0).any():
                     warnings.warn('Gradients of W may be incorrect at indices where W=0. Use W = SW_embedding.project_W(W, eps) with eps > 0')
@@ -578,10 +576,13 @@ class SW_embedding(nn.Module):
         # Normalize W
         if W.is_sparse:
             W_sum = ag.sum_sparseToDense.apply(W, -1)
-            W = ag.div_sparse_dense.apply(W, W_sum)
-            del W_sum
+            W = ag.div_sparse_dense.apply(W, W_sum)            
         else:
-            W = W / torch.sum(W, dim=-1, keepdim=True)
+            W_sum = torch.sum(W, dim=-1, keepdim=True)
+            W = W / W_sum
+        
+        assert (W_sum > 0).all(), "W assigns an all-zero weight to one of its distributions"
+        del W_sum
 
         # For compatibility reasons, we support the case of zero-dimensional output tensor
         if self.m == 0:
@@ -1315,7 +1316,9 @@ class ag:
         def forward(ctx, X, dim):
             assert X.is_coalesced(), 'X must be coalesced'
             ctx.dim = dim if dim >= 0 else ( dim + X.dim() )
-            return sp.sparse_cumsum(X, dim=ctx.dim)
+            out, max_slice_nonzeros = sp.sparse_cumsum(X, dim=ctx.dim, return_max_slice_nonzeros=True)
+            ctx.max_slice_nonzeros = max_slice_nonzeros
+            return out
 
 
         @staticmethod
@@ -1324,7 +1327,7 @@ class ag:
             dim = ctx.dim
 
             if ctx.needs_input_grad[0]:
-                grad_input = sp.sparse_cumsum(grad_output, dim=dim, reverse=True) 
+                grad_input = sp.sparse_cumsum(grad_output, dim=dim, reverse=True, max_slice_nonzeros=ctx.max_slice_nonzeros) 
             else:
                 grad_input = None
 
@@ -1496,13 +1499,11 @@ class sp:
         return sp.sparse_coo_tensor_coalesced(indices=inds, values=out_vals, size=A.shape)
 
 
-    def sparse_cumsum(A, dim, reverse=False):
-        # Ensure the input is a sparse tensor
-        if not A.is_sparse:
-            raise ValueError("Input tensor must be a sparse tensor.")
-        
-        # Coalesce the tensor to ensure unique indices
-        # assert_coalesced(A)
+    # Computes the cumsum on the nonzero entries of a sparse tensor A along dimension dim
+    # max_slice_nonzers: An upper bound on the maximal number of nonzeros of A along dimension dim, taken over all slices of A along dim
+    def sparse_cumsum(A, dim, reverse=False, max_slice_nonzeros=None, return_max_slice_nonzeros=False):
+        assert A.is_sparse, "input tensor must be sparse"
+        assert_coalesced(A)
         
         inds = A.indices()
         vals = A.values()
@@ -1535,35 +1536,38 @@ class sp:
             keys_sorted = keys[sort_inds]
             del keys
 
+        if max_slice_nonzeros is None:
+            _, counts_consecutive = torch.unique_consecutive(keys_sorted, return_counts=True)
+            max_slice_nonzeros = int(torch.max(counts_consecutive))
+            del _, counts_consecutive
+
 
         # Sort the values according to the keys, to form contiguous segments
         vals_sorted = vals[sort_inds]
         
-        # TODO: Calculate the maximal vertex degree somewhere earlier in the code from W, and pass max_seg_size to segcumsum
-        #       explicitly to improve the memory bottleneck
-        if (vals_sorted.dtype != torch.float64) and sw_embedding_high_precision:
+        if (not sw_embedding_high_precision) or (vals_sorted.dtype == torch.float64):
+            # TODO: Verify that this in-place action on vals_sorted does not destroy the original A
+            vals_sorted_cumsum = segcumsum(vals_sorted, keys_sorted, in_place=True, max_seg_size=max_slice_nonzeros, thorough_verify_input=sw_embedding_debug_mode)
+            del vals_sorted
+        else:
             dtype_orig = vals_sorted.dtype
             vals_sorted = vals_sorted.to(torch.float64)
             vals_sorted_cumsum = segcumsum(vals_sorted, keys_sorted, in_place=True, thorough_verify_input=sw_embedding_debug_mode)
             del vals_sorted
             vals_sorted_cumsum = vals_sorted_cumsum.to(dtype_orig)
-        else:
-            # TODO: Verify that this in-place action on vals_sorted does not destroy the original A
-            vals_sorted_cumsum = segcumsum(vals_sorted, keys_sorted, in_place=True, thorough_verify_input=sw_embedding_debug_mode)
-            del vals_sorted
 
         perm_inv = torch.argsort(sort_inds, dim=0)
         del sort_inds
-
-        #out = torch.sparse_coo_tensor(indices=inds[:,sort_inds], values=vals_sorted_cumsum).coalesce()
-        #return out
 
         vals_out = vals_sorted_cumsum[perm_inv]
         
         # Create a new sparse tensor with cumulative sum values
         out = sp.sparse_coo_tensor_coalesced(indices=inds, values=vals_out, size=shape)
         
-        return out
+        if return_max_slice_nonzeros:
+            return out, max_slice_nonzeros
+        else:
+            return out
         
 
     def sparse_flip(A, dim):

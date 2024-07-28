@@ -81,7 +81,7 @@ def segcumsum(values, segment_ids, max_seg_size=None, in_place=False, thorough_v
         del counts_total
 
         assert num_segments == num_segments_unique, 'repeated segment IDs detected'
-        assert max_seg_size == max_seg_size_real, 'incorrect max_seg_size detected (got %d, correct is %d)' % (max_seg_size, int(torch.max(counts_consecutive)))
+        assert max_seg_size == max_seg_size_real, 'incorrect max_seg_size detected (got %d, correct is %d)' % (max_seg_size, max_seg_size_real)
 
         assert not torch.isinf(values).any(), "Found infs in ''values''"
         assert not torch.isnan(values).any(), "Found nans in ''values''"
