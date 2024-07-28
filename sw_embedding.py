@@ -4,10 +4,11 @@
 # Technion Institute of Technology
 # Haifa, Israel
 
-version = '1.42'
+version = '1.43a'
 version_date = '2024-07-28'
 
 # Changelog:
+# 1.43a   Testing the computation time of sum(A,dim=0) when A is sparse
 # 1.42    More memory-efficient sparse_cumsum backward()
 # 1.41    Added reverse option to sparse_cumsum
 # 1.4     Incorporated segcumsum
@@ -500,6 +501,10 @@ class SW_embedding(nn.Module):
             #       Currently there is no is_dense() function in torch, so reading the layout string directly is the 2nd best.
             if W.is_sparse or W.layout != torch.strided:
                 assert W.layout == torch.sparse_coo, ( "Sparse W has an unsupported sparsity layout '%s'. Only the COO layout (torch.sparse_coo) is currently supported." % (W.layout) )
+
+                # TODO: Add int64 indexing support
+                int32_max = torch.iinfo(torch.int32).max
+                assert W.numel() <= int32_max, 'currently sparse W is only supported when W.numel() <= maximal int32 (2147483647)'
 
                 assert W.is_coalesced(), 'Sparse W must be coalesced'
 
@@ -1003,30 +1008,38 @@ class ag:
             assert A.is_sparse, 'A must be sparse'
             assert A.is_coalesced(), 'A must be coalesced'
 
-            out = torch.sum(A, dim=dim).to_dense().unsqueeze(dim=dim)
+            produce_junk = False
+
+            if not produce_junk:
+                out = torch.sum(A, dim=dim).to_dense().unsqueeze(dim=dim)
+            else:
+                s = list(A.shape)
+                s[dim] = 1
+                out = torch.ones(size=s, device=A.device, dtype=A.dtype)
 
             if ctx.needs_input_grad[0]:
                 ctx.dim = dim if dim >= 0 else ( dim + A.dim() )
-                ctx.save_for_backward(A)
+                ctx.shape = A.shape
+                ctx.save_for_backward(A.indices())
 
             return out
 
         @staticmethod
         @once_differentiable
         def backward(ctx, grad_output):        
-            dim = ctx.dim
-            A, = ctx.saved_tensors
-        
-            if grad_output.is_sparse:
-                assert False, "Didn't handle this case"
-                pass
-            else:
-                inds_out = A.indices().clone()
-                inds_out[dim,:] = 0
-                
-                vals = grad_output[tuple(inds_out)]
+            assert not grad_output.is_sparse, "This shouldn't happen"
 
-                grad_input = sp.sparse_coo_tensor_coalesced(indices=A.indices(), values=vals, size=A.shape)
+            dim = ctx.dim
+            shape = ctx.shape
+            A_inds, = ctx.saved_tensors
+
+            ndims = A_inds.shape[0]
+            squeeze_vec = torch.ones(size=(ndims,1), device=A_inds.device, dtype=A_inds.dtype)
+            squeeze_vec[dim] = 0
+            
+            vals = grad_output[tuple(A_inds*squeeze_vec)]
+
+            grad_input = sp.sparse_coo_tensor_coalesced(indices=A_inds, values=vals, size=shape)
 
             return grad_input, None
 
@@ -1441,6 +1454,7 @@ class sp:
 
 
     # The inverse of torch.unravel_index()
+    # Torch JIT does not speed up this function
     def ravel_index(indices, shape):
         assert indices.dim() == 2, 'indices must be a 2-dimensional tensor'
         nd = indices.shape[0]
@@ -1451,7 +1465,13 @@ class sp:
         weights = shape.reshape([nd,1]).flip(dims=(0,))[0:-1].cumprod(dim=0).flip(dims=(0,))
         weights = torch.cat((weights, torch.ones(size=(1,1), device=weights.device, dtype=weights.dtype)), dim=0)
 
-        out = torch.sum(indices*weights, dim=0) 
+        #out = torch.sum(indices*weights, dim=0) 
+        out = torch.sum(indices.to(torch.int32)*weights.to(torch.int32), dim=0, dtype=torch.int32)
+
+        if sw_embedding_debug_mode:
+            out_true = torch.sum(indices*weights, dim=0) 
+            assert ( out.to(out_true.dtype) == out ).all(), 'int32 truncation error. input tensor size is larger than torch.iinfo(torch.int32).max'
+
         return out
 
 
@@ -1468,7 +1488,7 @@ class sp:
         else:
             raise RuntimeError('sort_inds_vals: invalid shape data type')
 
-        inds1d = sp.ravel_index(indices, shape)
+        inds1d = sp.ravel_index(indices, tuple(shape))
         
         debug = sw_embedding_debug_mode
         if debug:
@@ -1519,12 +1539,9 @@ class sp:
         shape2 = [shape[d] for d in range(len(shape)) if d != dim]
         
         # Get the unique keys for the other dimensions
-        keys = sp.ravel_index(inds[dims2,:], shape2)
+        keys = sp.ravel_index(inds[dims2,:], tuple(shape2))
 
         # segcumsum below only takes int32 ids as inputs
-        # we convert keys already over here since sorting int32 is likely faster than int64
-        # TODO: Add code here that verifies we do not truncate large integers
-        keys = keys.to(torch.int32)
 
         # Sort the keys and get the counts of each unique key
         if not reverse:
