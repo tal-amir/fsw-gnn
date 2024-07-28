@@ -126,8 +126,6 @@ def segcumsum_cuda(values, segment_ids, max_seg_size, in_place):
     # Set to an arbitrarily large number (e.g. 1e6) to determine automatically.
     max_num_threads_per_block = 1e6
 
-    print('dtype = ', segment_ids.dtype)
-
     assert values.device.type == 'cuda', 'the tensor ''values'' must be on a CUDA device'
     assert segment_ids.device.type == 'cuda', 'the tensor ''segment_ids'' must be on a CUDA device'
     assert segment_ids.dtype == torch.int64, 'segment_ids must have int64 dtype'
