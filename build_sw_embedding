@@ -11,7 +11,7 @@ fi
 
 printf "Building... "
 
-"$CUDA_HOME/bin/nvcc" -shared -o libsegcumsum.so -O3 --compiler-options '-O3 -fPIC' segcumsum.cu -lcudart -Wno-deprecated-gpu-targets \
+"$CUDA_HOME/bin/nvcc" -shared -o libsw_embedding.so -O3 --compiler-options '-O3 -fPIC' sw_embedding.cu -Wno-deprecated-gpu-targets \
     -gencode arch=compute_50,code=sm_50 \
     -gencode arch=compute_52,code=sm_52 \
     -gencode arch=compute_60,code=sm_60 \

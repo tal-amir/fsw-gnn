@@ -4,10 +4,11 @@
 # Technion Institute of Technology
 # Haifa, Israel
 
-version = '1.44'
-version_date = '2024-07-28'
+version = '1.5'
+version_date = '2024-07-29'
 
 # Changelog:
+# 1.5     Speed up by sum_sparse, incorporated segcumsum
 # 1.44    Added end-to-end support for int64 indexing
 # 1.43a   Testing the computation time of sum(A,dim=0) when A is sparse
 # 1.42    More memory-efficient sparse_cumsum backward()
@@ -32,6 +33,10 @@ version_date = '2024-07-28'
 # 1.21    Added reset_parameters()
 #         Added type hinting and enforcement
 
+#TODO:
+# 1. Incorporate segcumsum.py into this code; rename segcumsum.cu sw_embedding.cu
+# 2. Look for all calls to torch.sum() on sparse tensors and replace them with my implementation
+# 3. Create a Timers class and measure the time of the whole code. See if it adds up to 25 seconds
 
 import numpy as np
 
@@ -48,12 +53,13 @@ import importlib.util
 import os
 import time
 
-# Load the segcumsum module from the same directory as the current file
+import ctypes
+
+# Load the segcumsum shared library from the same directory as the current file
 mydir = os.path.dirname(os.path.abspath(__file__))
-segcumsum_spec = importlib.util.spec_from_file_location('segcumsum', os.path.join(mydir, 'segcumsum.py'))
-segcumsum_module = importlib.util.module_from_spec(segcumsum_spec)
-segcumsum_spec.loader.exec_module(segcumsum_module)
-segcumsum = getattr(segcumsum_module, 'segcumsum')
+libsw_embedding_path = os.path.join(mydir, "libsw_embedding.so")
+libsw_embedding = ctypes.CDLL(libsw_embedding_path)
+
 
 # Turn this on to run some verifications and sanity checks during runtime.
 # If an error is encountered, a runtime error is raised
@@ -67,6 +73,8 @@ sw_embedding_basic_safety_checks = True
 # Tells whether to use float64 in numerically-challenging parts of the code even if the data is in float32 format.
 # This was not observed to increase accuracy, and it incurs a significantly narrower memory bottleneck and a slightly higher running time.
 sw_embedding_high_precision = False
+
+tal_global_timer = 0
 
 ''' Maps multisets in R^d to vectors in R^m using the Sliced-Wasserstrin Embedding.
     Also supports weighted point-clouds in R^d, which are regarded as discrete distributions over R^d.
@@ -227,6 +235,7 @@ class SW_embedding(nn.Module):
         self.reset_parameters()
 
 
+
     # Resets the model parameters (projection vectors and frequencies) and updates the model settings.
     @type_enforced.Enforcer(enabled=True)
     def reset_parameters(self,
@@ -297,6 +306,7 @@ class SW_embedding(nn.Module):
         return self
 
 
+
     def to(self, *args, **kwargs):
         if 'dtype' in kwargs:
             arg = kwargs['dtype']
@@ -322,13 +332,16 @@ class SW_embedding(nn.Module):
         return self
 
 
+
     def get_device(self):
         return self.projVecs.device
+
 
 
     def get_dtype(self):
         return self.projVecs.dtype
     
+
 
     def generate_embedding_parameters(d, nSlices, nFreqs, cartesian_mode, freqs_init, minimize_slice_coherence, device, report, report_on_coherence_minimization):
         dtype_init = torch.float64
@@ -356,6 +369,7 @@ class SW_embedding(nn.Module):
         assert not torch.isinf(projVecs).any(), "Found infs in projVecs"
         assert not torch.isnan(projVecs).any(), "Found nans in projVecs"
         assert not (projVecs == 0).all(dim=1).any(), 'Found zero vectors in projVecs'
+
 
 
         ### B. Generate frequencies
@@ -420,6 +434,7 @@ class SW_embedding(nn.Module):
         return projVecs, freqs, bias
 
 
+
     # Spreads the frequencies on an interval centered at 'center' with the given radius, in an equispaced manner.
     # This might be useful when using the embedding for graph message passing with learnable_projs=True, as the magnitude of the
     # projection vectors already determines the effective frequency, and having a very high max-frequency-to-low-frequency ratio
@@ -440,6 +455,7 @@ class SW_embedding(nn.Module):
         self.load_state_dict(state_dict)
 
         return self
+
 
 
     @type_enforced.Enforcer(enabled=True)
@@ -530,6 +546,7 @@ class SW_embedding(nn.Module):
                     warnings.warn('Gradients of W may be incorrect at indices where W=0. Use W = SW_embedding.project_W(W, eps) with eps > 0')
 
 
+
         ### B. Verify input sizes
             
         assert len(X.shape) >= 2, "X must be a tensor of order at least 2"
@@ -563,6 +580,7 @@ class SW_embedding(nn.Module):
             assert (len(W.shape) == len(X.shape)) and (W.shape[-1] == X.shape[-2]) and (W.shape[0:-2] == X.shape[0:-2]), "Shape mismatch between X and W: When graph_mode=True, if W.shape = (b1,b2,...,bk,nRecipients,n) then X.shape should be (b1,b2,...,bk,n,d)"
 
 
+
         ### C. Precalculate axis indices and output shape
              
         # These are the different axes we use to store data for processing. These definitions are repeated in forward_helper()
@@ -584,8 +602,13 @@ class SW_embedding(nn.Module):
             
         # Normalize W
         if W.is_sparse:
+            global tal_global_timer; t_start = time.time()
+            #tal_global_timer += time.time()-t_start
+
             W_sum = ag.sum_sparseToDense.apply(W, -1)
             W = ag.div_sparse_dense.apply(W, W_sum)            
+
+            tal_global_timer += time.time()-t_start
         else:
             W_sum = torch.sum(W, dim=-1, keepdim=True)
             W = W / W_sum
@@ -626,6 +649,7 @@ class SW_embedding(nn.Module):
             X_emb += bias_reshape
 
         return X_emb
+
 
 
     def forward_helper(X, W, projVecs, freqs, graph_mode, cartesian_mode, batch_dims):
@@ -775,6 +799,7 @@ class SW_embedding(nn.Module):
         return out.to_dense()
 
 
+
     # Project W to the probability simplex. To be used in a Projected Gradient Descent scheme.
     @type_enforced.Enforcer(enabled=True)
     def project_W(W : torch.Tensor, eps : float = 1e-8):
@@ -847,7 +872,6 @@ class SW_embedding(nn.Module):
 
 
 
-
 #############################################################################################################
 ##                                                  Tools                                                  ##
 #############################################################################################################
@@ -857,6 +881,7 @@ def assert_coalesced(A):
     if debug:
         assert A.is_coalesced(), 'tensor is not coalesced'
 
+
 # Computes a finite difference with zero padding
 def diff_zeropad(input, dim):
     pad_shape = replace_in_tuple(tuple(input.shape), index=dim, value=1)
@@ -865,9 +890,11 @@ def diff_zeropad(input, dim):
     return out
 
 
+
 def replace_in_tuple(T, index, value):
     out = T[0:index] + (value,) + T[(index+1):len(T)]
     return out
+
 
 
 @type_enforced.Enforcer(enabled=True)
@@ -878,9 +905,11 @@ def qprint(q : bool, s : str =''):
         print(s, end='')
 
 
+
 @type_enforced.Enforcer(enabled=True)
 def qprintln(q : bool, s : str =''):
     qprint(q, s+'\n')
+
 
 
 # Performs something like target[:,:,...,:,inds,:,...,:] = source, where the argument 'inds' is given at dimension dim
@@ -889,6 +918,7 @@ def assign_at(target, source, dim, inds):
     scatter_inds = inds.reshape(scatter_inds_shape).expand_as(source)
     target.scatter_(dim=dim, index=scatter_inds, src=source)
     
+
 
 def ifnone(a,b):
     return a if (a is not None) else b
@@ -924,7 +954,9 @@ class ag:
 
                 # Try to save space
                 perms_max = A.shape[dim]-1
-                #assert perms_max == perms.max() # Sanity check
+
+                if sw_embedding_debug_mode:
+                    assert perms_max == perms.max() # Sanity check
 
                 if perms_max <= torch.iinfo(torch.int16).max:
                     perms = perms.to(dtype=torch.int16)
@@ -956,6 +988,7 @@ class ag:
             return out, None, None, None
 
 
+
     # Equivalent to: torch.unsqueeze(dim)
     class unsqueeze_sparse(torch.autograd.Function):
         @staticmethod
@@ -985,7 +1018,6 @@ class ag:
                 return sp.sparse_coo_tensor_coalesced(indices=inds, values=vals, size=output_shape)
 
 
-
         @staticmethod
         @once_differentiable
         def backward(ctx, grad_output):        
@@ -1005,6 +1037,7 @@ class ag:
             return grad_input, None
 
 
+
     # Equivalent to: torch.sum(A, dim=dim, keepdim=True)
     class sum_sparseToDense(torch.autograd.Function):
         @staticmethod
@@ -1012,11 +1045,13 @@ class ag:
             assert A.is_sparse, 'A must be sparse'
             assert A.is_coalesced(), 'A must be coalesced'
 
-            produce_junk = False
+            variant = 2
 
-            if not produce_junk:
-                out = torch.sum(A, dim=dim).to_dense().unsqueeze(dim=dim)
-            else:
+            if variant == 1:
+                out = torch.sparse.sum(A, dim=dim).to_dense().unsqueeze(dim=dim)
+            elif variant == 2:
+                out = sp.sum_sparse(A, dim=dim).to_dense()
+            elif variant == 3:
                 s = list(A.shape)
                 s[dim] = 1
                 out = torch.ones(size=s, device=A.device, dtype=A.dtype)
@@ -1027,6 +1062,7 @@ class ag:
                 ctx.save_for_backward(A.indices())
 
             return out
+
 
         @staticmethod
         @once_differentiable
@@ -1048,10 +1084,12 @@ class ag:
             return grad_input, None
 
 
+
     # Equivalent to: A*B, where A is sparse, B is dense, and the shape of B is broadcastable to A
     class mul_sparse_dense(torch.autograd.Function): # TODO: Try to get rid of coalesce here
         @staticmethod
-        def forward(ctx, A, B):
+        def forward(ctx, A, B):    
+
             assert A.is_sparse, 'A must be sparse'
             assert not B.is_sparse, 'B cannot be sparse'
             assert (torch.logical_or(torch.tensor(A.shape) == torch.tensor(B.shape), torch.tensor(B.shape) == 1)).all(), "B must be of size that allows broadcasting to A"
@@ -1064,7 +1102,6 @@ class ag:
             inds[broadcast_dims, :] = 0
             
             vals = A.values() * B[tuple(inds)]
-
             out = sp.sparse_coo_tensor_coalesced(indices=A.indices(), values=vals, size=A.shape)
 
             A_save = A if ctx.needs_input_grad[1] else None
@@ -1074,6 +1111,7 @@ class ag:
             ctx.broadcast_dims = broadcast_dims
 
             return out
+
 
         @staticmethod
         @once_differentiable
@@ -1088,6 +1126,7 @@ class ag:
                 # to the size of grad_output; it is the same size of A, which can be huge.
 
                 if True:
+                    # TODO: Measure time
                     out_A = B * grad_output.to_sparse()                    
                 else:
                     # TODO: Implement this more efficient method. There is a problem with dims due to broadcasting
@@ -1097,24 +1136,18 @@ class ag:
                     vals = grad_output.values().clone()
                     vals *= B[tuple(inds)]
                     out_A = sp.sparse_coo_tensor_coalesced(indices=inds, values=vals, size=grad_output.shape)
-                    
             
             if ctx.needs_input_grad[1]:
                 # B is dense, so the gradient with respect to B should also be dense.
                 if len(broadcast_dims) > 0:
                     out_B = A*grad_output # This is still sparse and can be huge
-                    out_B = out_B.sum(dim=broadcast_dims) #TODO: suspected for slowness
-
-                    # Restore original size as before sum()
-                    for i in broadcast_dims:
-                        out_B = out_B.unsqueeze(dim=int(i))
-
-                    out_B = out_B.to_dense()
+                    out_B = sp.sum_sparse(out_B, dim=broadcast_dims, max_slice_nonzeros=None).to_dense()
                 else:
                     # Note that if B didn't need to be broadcast, this size is not huge
                     out_B = (A*grad_output).to_dense()
 
             return out_A, out_B
+
 
 
     # Equivalent to: A/B, where A is sparse, B is dense, and the shape of B is broadcastable to A
@@ -1146,6 +1179,7 @@ class ag:
 
             return out
 
+
         @staticmethod
         @once_differentiable
         def backward(ctx, grad_output):        
@@ -1161,14 +1195,9 @@ class ag:
             if ctx.needs_input_grad[1]:
                 # B is dense, so the gradient with respect to B should also be dense.
                 if len(broadcast_dims) > 0:
-                    out_B = A*grad_output # This is still sparse and can be huge
-                    out_B = out_B.sum(dim=broadcast_dims) # TODO: Similarly to mul_sparse_div, suspected for slowness
 
-                    # Restore original size as before sum()
-                    for i in broadcast_dims:
-                        out_B = out_B.unsqueeze(dim=int(i))
-                    
-                    out_B = out_B.to_dense()
+                    out_B = A*grad_output # This is still sparse and can be huge
+                    out_B = sp.sum_sparse(out_B, dim=broadcast_dims, max_slice_nonzeros=None).to_dense()                     
                     out_B = -out_B / torch.square(B)
                 else:
                     out_B = (A*grad_output).to_dense() / (-torch.square(B))
@@ -1207,6 +1236,7 @@ class ag:
 
             return sp.sparse_coo_tensor_coalesced(indices=inds, values=out_vals, size=A.shape)
 
+
         @staticmethod
         @once_differentiable
         def backward(ctx, grad_output):
@@ -1223,6 +1253,7 @@ class ag:
                 out_B = sp.sparse_coo_tensor_coalesced(indices=inds, values=A_vals, size=shape) * grad_output
 
             return out_A, out_B
+
 
 
     # Equivalent to torch.sinc(A) * torch.cos(B), where A and B are spase tensors of the same shape and nonzero pattern.
@@ -1257,6 +1288,7 @@ class ag:
             ctx.inds = inds
 
             return sp.sparse_coo_tensor_coalesced(indices=inds, values=out_vals, size=A.shape)
+
 
         @staticmethod
         @once_differentiable
@@ -1304,6 +1336,7 @@ class ag:
 
             return Xs, Xi
 
+
         @staticmethod
         @once_differentiable
         def backward(ctx, grad_output, aaa):
@@ -1317,15 +1350,13 @@ class ag:
             if not ctx.needs_input_grad[0]:
                 grad_input = None
             elif grad_output.is_sparse:
-                assert False, 'Check this case. Make sure it works.'
-                grad_output = grad_output.coalesce()
-                inds = grad_output.indices().clone()
-                inds[ctx.dim,:] = Xi_inv[tuple(inds)]
-                grad_input = sp.sparse_coo_tensor_coalesced(indices=inds, values=grad_output.values(), size=grad_output.shape)
+                assert False, 'This should not happen'
             else:
                 grad_input = torch.gather(grad_output, dim=ctx.dim, index=Xi_inv)
 
             return grad_input, None, None
+
+
 
     # Equivalent to torch.cumsum(X, dim=dim)
     class cumsum_sparse(torch.autograd.Function):
@@ -1351,6 +1382,7 @@ class ag:
             return grad_input, None
 
 
+
     # Replicates the sparse tensor A n times along the dimension dim
     class repmat_sparse(torch.autograd.Function):
         @staticmethod
@@ -1362,8 +1394,9 @@ class ag:
 
             assert_coalesced(A)
 
+            #TODO: Restore
             # Three different variants to yield the same result.
-            variant = 3 # preferable: no. 3
+            variant = 3 # preferable: no. 3 
 
             # Simplest formulation. Requires a lot of memory.
             if variant == 1:
@@ -1376,9 +1409,14 @@ class ag:
                     out = torch.cat([out, A])
 
             # Memory and time efficient.
-            elif variant == 3:
+            elif variant == 3:                 
                 v = A.shape[dim] * torch.arange(n, device=A.device)
-                v = torch.kron(v, torch.ones(A.values().numel(), device=v.device, dtype=v.dtype))
+
+                # Two variants. The first is simpler, but empirically their running time is almost identical.
+                if True:
+                    v = torch.repeat_interleave(v, A.values().numel(), dim=0)
+                else:
+                    v = torch.kron(v, torch.ones(A.values().numel(), device=v.device, dtype=v.dtype))
 
                 inds = A.indices().repeat([1,n])                
                 inds[dim,:] += v
@@ -1401,10 +1439,9 @@ class ag:
             else:
                 raise RuntimeError('This should not happen')
 
-
             return out
 
-        
+
         @staticmethod
         @once_differentiable
         def backward(ctx, grad_output):
@@ -1418,6 +1455,9 @@ class ag:
                 # Here we must coalesce
                 grad_input = torch.sparse_coo_tensor(indices=inds, values=grad_output.values(), size=ctx.shape)
                 grad_input = grad_input.coalesce()
+
+                # grad_input = torch.empty(ctx.shape, device=grad_output.device, dtype=grad_output.dtype)
+                # grad_input = scatter_add(grad_output.values(), inds, out=grad_input)
             else:
                 grad_input = None
 
@@ -1442,6 +1482,8 @@ class sp:
 
         return out   
 
+
+
     # returns a coalesced copy of A assuming that the indices of A are unique but just possibly unsorted
     def coalesce_unique(A):
         A_shape = A.shape
@@ -1449,12 +1491,15 @@ class sp:
         del A
         return sp.sparse_coo_tensor_coalesced(inds2, vals2, size=A_shape)
 
+
+
     # Verify that a sparse input tensor A is correctly coalesced.
     def verify_coalescence(A):
         assert A.is_coalesced(), 'verify_coalescence: input tensor is not coalesced'
         B = torch.sparse_coo_tensor(indices=A.indices(), values=A.values(), size=A.shape).coalesce()
         assert (B.indices() == A.indices()).all(), 'verify_coalescence: index mismatch in input'
         assert (B.values() == A.values()).all(), 'verify_coalescence: value mismatch in input'
+
 
 
     # The inverse of torch.unravel_index()
@@ -1472,6 +1517,7 @@ class sp:
         out = torch.sum(indices*weights, dim=0) 
 
         return out
+
 
 
     # Sort indices and values. Similar to coalesce(), but does not assume nor impose uniqueness.
@@ -1500,6 +1546,7 @@ class sp:
 
 
 
+    # TODO: Is this even called? Yes, from ag.div_sparse_dense.backard
     # Entrywise division of sparse A by dense A. Supports broadcasting of B to A.
     def div_sparse_dense(A,B): # TODO: Try to get rid of coalesce here
         assert A.is_sparse, 'A must be sparse'
@@ -1516,6 +1563,7 @@ class sp:
         out_vals = A_vals / B[tuple(inds)]
 
         return sp.sparse_coo_tensor_coalesced(indices=inds, values=out_vals, size=A.shape)
+
 
 
     # Computes the cumsum on the nonzero entries of a sparse tensor A along dimension dim
@@ -1555,12 +1603,10 @@ class sp:
             max_slice_nonzeros = int(torch.max(counts_consecutive))
             del _, counts_consecutive
 
-
         # Sort the values according to the keys, to form contiguous segments
         vals_sorted = vals[sort_inds]
         
         if (not sw_embedding_high_precision) or (vals_sorted.dtype == torch.float64):
-            # TODO: Verify that this in-place action on vals_sorted does not destroy the original A
             vals_sorted_cumsum = segcumsum(vals_sorted, keys_sorted, in_place=True, max_seg_size=max_slice_nonzeros, thorough_verify_input=sw_embedding_debug_mode)
             del vals_sorted
         else:
@@ -1577,12 +1623,13 @@ class sp:
         
         # Create a new sparse tensor with cumulative sum values
         out = sp.sparse_coo_tensor_coalesced(indices=inds, values=vals_out, size=shape)
-        
+
         if return_max_slice_nonzeros:
             return out, max_slice_nonzeros
         else:
             return out
         
+
 
     def sparse_flip(A, dim):
         assert not torch.is_grad_enabled(), 'This function can only be called within torch.no_grad(), as it is not meant to calculate gradients.'
@@ -1597,10 +1644,89 @@ class sp:
         inds2, vals2 = sp.sort_inds_vals(inds, vals, shape=A.shape, ensure_unique=True)
         out = sp.sparse_coo_tensor_coalesced(indices=inds2, values=vals2, size=A.shape)
 
-        # Probably slower alternative:
-        # out = torch.sparse_coo_tensor(indices=inds, values=vals, size=A.shape).coalesce()
-
         return out
+
+
+
+    # TODO: Finish this
+    # TODO: Call with the segment end indices saved somewhere, to save running time
+    def sum_sparse(A, dim, max_slice_nonzeros=None, return_max_slice_nonzeros=False):
+        assert A.is_sparse, "input tensor must be sparse"
+        assert_coalesced(A)
+        
+        inds = A.indices()
+        vals = A.values()
+
+        # Shape of the sparse tensor
+        shape = list(A.shape)
+
+        # Process dim
+        if isinstance(dim, numbers.Number):
+            dim = [dim,]
+        else:            
+            dim = list(dim)
+
+        for i,d in enumerate(dim):
+            dim[i] = d if d >= 0 else ( d + A.dim() )
+            assert (dim[i] >= 0) and (dim[i] < inds.shape[0])
+        
+        # Get the other dimensions excluding the one we're summing over,
+        # and get the shape along these dimensions.
+        dims2 = [d for d in range(len(shape)) if not d in dim]
+        shape2 = [shape[d] for d in range(len(shape)) if not d in dim]
+
+        # 6.9 seconds
+        # Get the unique keys for the other dimensions
+        keys = sp.ravel_index(inds[dims2,:], tuple(shape2))
+
+        # Sort the keys and get the counts of each unique key
+        keys_sorted, sort_inds = torch.sort(keys, dim=0, stable=True)
+        del keys
+
+        # TODO: See if we can save this time
+        # 3 seconds
+        if max_slice_nonzeros is None:
+            _, counts_consecutive = torch.unique_consecutive(keys_sorted, return_counts=True)
+            max_slice_nonzeros = int(torch.max(counts_consecutive))
+
+        # Sort the values according to the keys, to form contiguous segments
+        vals_sorted = vals[sort_inds]
+
+        # Get the linear index in vals_sorted of the last index of each slice along dims
+        slice_ends = counts_consecutive.cumsum(dim=0)-1
+
+        if (not sw_embedding_high_precision) or (vals_sorted.dtype == torch.float64):
+            vals_sorted_cumsum = segcumsum(vals_sorted, keys_sorted, in_place=True, max_seg_size=max_slice_nonzeros, thorough_verify_input=sw_embedding_debug_mode)
+            del vals_sorted
+        else:
+            dtype_orig = vals_sorted.dtype
+            vals_sorted = vals_sorted.to(torch.float64)
+            vals_sorted_cumsum = segcumsum(vals_sorted, keys_sorted, in_place=True, thorough_verify_input=sw_embedding_debug_mode)
+            del vals_sorted
+            vals_sorted_cumsum = vals_sorted_cumsum.to(dtype_orig)
+
+        # Calculate output shape
+        shape_out = list(A.shape)
+
+        for d in dim:
+            shape_out[d] = 1
+
+        # Prepare output values and indices
+        vals_out = vals_sorted_cumsum[slice_ends]
+
+        inds_out = inds[:, sort_inds[slice_ends]]
+        inds_out[dim,:] = 0
+
+        del sort_inds    
+        
+        # Create a new sparse tensor with cumulative sum values
+        out = sp.sparse_coo_tensor_coalesced(indices=inds_out, values=vals_out, size=shape_out)
+
+        if return_max_slice_nonzeros:
+            return out, max_slice_nonzeros
+        else:
+            return out
+        
 
 
     def permute(A, dim, perms, broadcast_perms_dim=None, backward_mode=False):
@@ -1615,33 +1741,48 @@ class sp:
         if backward_mode:
             # If we're in backward mode, do not invert
             perm_invs = perms
-        elif False:
-            perm_invs = torch.argsort(perms, dim=dim)
         else:
-            perm_invs = torch.empty_like(perms)
-            ar = torch.arange(perms.shape[dim], dtype=perms.dtype, device=perms.device)
-            ar = ar.reshape((1,)*dim + (len(ar),) + (1,)*(len(perms.shape)-(dim+1))).expand_as(perms)
-            perms = perms.to(dtype=torch.int64)
-            perm_invs.scatter_(dim=dim, index=perms, src=ar)
-            del ar
+                # Variant 1 is simpler and more practical
+                variant = 1
 
-        A = sp.coalesce_unique(A) # TODO: Tough to get rid of when permute() is applied to grad_out
+                if variant == 1:
+                    perm_invs = torch.argsort(perms, dim=dim)
+                elif variant == 2:
+                    perm_invs = torch.empty_like(perms)
+                    ar = torch.arange(perms.shape[dim], dtype=perms.dtype, device=perms.device)
+                    ar = ar.reshape((1,)*dim + (len(ar),) + (1,)*(len(perms.shape)-(dim+1))).expand_as(perms)
+                    perms = perms.to(dtype=torch.int64)
+                    perm_invs.scatter_(dim=dim, index=perms, src=ar)
+                    del ar
+
+        needs_coalesce = True
+
+        if needs_coalesce:
+            # TODO: Tough to get rid of when permute() is applied to grad_out
+            A = sp.coalesce_unique(A) 
+
         inds = A.indices().clone()
             
         if broadcast_perms_dim is not None:
             perm_inds = inds.clone()
             perm_inds[broadcast_perms_dim,:] = 0 
+            inds[dim,:] = perm_invs[tuple(perm_inds)]
+            del perm_inds
+
+            # Alternative: Both take the same time
+            # broadcast_mask = torch.ones(size=(A.dim(),1), device=A.device, dtype=inds.dtype)
+            # broadcast_mask[broadcast_perms_dim] = 0
+            # inds[dim,:] = perm_invs[tuple(broadcast_mask*inds)]
         else:
-            perm_inds = inds
+            inds[dim,:] = perm_invs[tuple(inds)]
 
-        inds[dim,:] = perm_invs[tuple(perm_inds)]
-
-        inds2, vals2 = sp.sort_inds_vals(inds, A.values().clone(), shape=A.shape, ensure_unique=True)
-        del inds, perm_inds, perms, perm_invs
+        inds2, vals2 = sp.sort_inds_vals(inds, A.values(), shape=A.shape, ensure_unique=True)
+        del inds, perms, perm_invs
 
         out = sp.sparse_coo_tensor_coalesced(indices=inds2, values=vals2, size=A.shape)
 
         return out
+
 
 
     # Returns a tensor of the same size as x, containing the values of d/dx sinc(x)
@@ -1654,6 +1795,259 @@ class sp:
             dy = torch.autograd.grad(y, x2, torch.ones_like(y), create_graph=False)[0]
 
         return dy
+
+
+
+#############################################################################################################
+##                                            Segmented Cumsum                                             ##
+#############################################################################################################
+
+# This is the main function that calculates the segmented cumsum.
+# Input arguments: 
+#   max_seg_size: an upper bound on the maximal length of a contiguous segment in <segment_ids>. If not provided, detected automatically.
+#   in_place:     if set to True, writes the output directly to <values> instead of allocating new memory.
+#   thorough_verify_input: verifies the input for correctness. meant for debugging purposes. in particular, checks <segment_ids>
+#                          for repeated ids of different segments, and looks for infs and nans in <values>.
+#   always_use_pure_torch: when set to True, always uses the pure torch implementation.
+#                          otherwise, when the input is on a cuda device, uses a custom cuda implementation.
+#                          the cuda implementation has a better memory bottleneck.
+#                          in terms of running time, both are comparable, with two-fold differences for one over
+#                          the other or vice versa.
+#
+# Output: The segmented cumsum of <values> according to <segment_ids>.
+def segcumsum(values, segment_ids, max_seg_size=None, in_place=False, thorough_verify_input=False, always_use_pure_torch=False):
+    # Verify input device, dtypes and shapes
+    assert values.dim() == 1, 'values must be a 1-dimensional tensor'
+    assert segment_ids.dim() == 1, 'segment_ids must be a 1-dimensional tensor'
+    assert segment_ids.numel() == values.numel(), 'values and segment_ids must contain the same number of elements'
+    assert segment_ids.dtype in (torch.int32,torch.int64), 'segment_ids must have int32 or int64 dtype'
+    assert values.device == segment_ids.device, 'values and segment_ids must be on the same device'
+
+    # Ensure all data is contiguous
+    assert not segment_ids.is_sparse, 'segment_ids cannot be sparse'
+    assert segment_ids.is_contiguous(), 'segment_ids must be in contiguous format'
+
+    assert not values.is_sparse, 'values cannot be sparse'
+    assert (not in_place) or values.is_contiguous(), 'when in_place==True, values must be in contiguous format'
+
+    num_segments = None
+
+    if max_seg_size is None:
+        # Calculate maximal segmet size
+        _, counts_consecutive = torch.unique_consecutive(segment_ids, return_counts=True)
+        del _
+        num_segments = counts_consecutive.numel()
+        max_seg_size_real = int(torch.max(counts_consecutive))
+        max_seg_size = max_seg_size_real
+        del counts_consecutive
+    else:
+        assert isinstance(max_seg_size, numbers.Number)
+        assert max_seg_size >= 1
+
+    if thorough_verify_input:
+        if num_segments is None:
+            _, counts_consecutive = torch.unique_consecutive(segment_ids, return_counts=True)
+            del _
+            num_segments = counts_consecutive.numel()
+            max_seg_size_real = int(torch.max(counts_consecutive))
+            del counts_consecutive
+
+        _, counts_total = torch.unique(segment_ids, return_counts=True)
+        del _
+        num_segments_unique = counts_total.numel()
+        del counts_total
+
+        assert num_segments == num_segments_unique, 'repeated segment IDs detected'
+        assert max_seg_size == max_seg_size_real, 'incorrect max_seg_size detected (got %d, correct is %d)' % (max_seg_size, max_seg_size_real)
+
+        assert not torch.isinf(values).any(), "Found infs in ''values''"
+        assert not torch.isnan(values).any(), "Found nans in ''values''"
+
+    # Calculate and return the segmented cumsum
+    if (values.device.type == 'cuda') and (not always_use_pure_torch):
+        return segcumsum_cuda(values, segment_ids, max_seg_size, in_place)
+    else:
+        return segcumsum_torch(values, segment_ids, max_seg_size, in_place)
+    
+# torch implementation
+def segcumsum_torch(values, segment_ids, max_seg_size, in_place):
+    assert values.is_contiguous(), 'in the segcumsum_torch implementation, ''values'' must be in contiguous format'
+
+    if in_place:
+        out = values
+    else:
+        out = torch.clone(values, memory_format=torch.contiguous_format)
+
+    return segcumsum_torch_main(out, segment_ids, max_seg_size)
+
+
+# main loop of torch implementation
+# Note: using torch jit here makes it empirically slower
+def segcumsum_torch_main(values, segment_ids, max_seg_size : int):
+    n = values.numel()
+
+    stride = 0
+    while stride < max_seg_size:
+        stride = max(1, 2*stride)
+        values[stride:n] += (segment_ids[stride:n] == segment_ids[0:(n-stride)]) * values[0:(n-stride)]
+    
+    return values
+
+
+# cuda implementation
+def segcumsum_cuda(values, segment_ids, max_seg_size, in_place):
+    # Maximal number of CUDA threads to use per block.
+    # Note: This is automatically capped by the maximal number supported by the architecture.
+    # Set to an arbitrarily large number (e.g. 1e6) to determine automatically.
+    max_num_threads_per_block = 1e6
+
+    assert values.device.type == 'cuda', 'the tensor ''values'' must be on a CUDA device'
+    assert segment_ids.device.type == 'cuda', 'the tensor ''segment_ids'' must be on a CUDA device'
+    assert segment_ids.dtype == torch.int64, 'segment_ids must have int64 dtype'
+    
+    # Process input data types
+    if values.dtype == torch.float32:
+        dtype_num = 0;
+        c_num_type = ctypes.c_float
+    elif values.dtype == torch.float64:
+        dtype_num = 1;
+        c_num_type = ctypes.c_double
+    else:
+        raise RuntimeError("Unsupported input_tensor dtype ''%s''" % (str(values.dtype)))
+
+    n = values.numel()
+
+    # Determine the maximal number of threads per block supported in the current CUDA device
+    cuda_max_threads_per_block = get_max_threads_per_block(values.device.index)
+
+    # Take the smallest multiple of 32 greater or equal to the input size, but no less than 64
+    num_threads_2 = max(64, (n+31)//32)
+
+    threads_per_block = min(num_threads_2, max_num_threads_per_block, cuda_max_threads_per_block)
+    shared_memory_size = threads_per_block * ctypes.sizeof(c_num_type)
+
+    assert threads_per_block > 1, 'threads_per_block must be greater than 1'
+
+    # Construct block hierarchy
+    tensor_sizes = [ n, ]
+    num_blocks = []
+    max_seg_sizes = [ max_seg_size, ]
+    
+    # Stop dividing when the whole tensor fits in one block
+    while tensor_sizes[-1] > threads_per_block:
+        tensor_size_new = (tensor_sizes[-1] + threads_per_block - 1) // threads_per_block
+        tensor_sizes.append(tensor_size_new)
+
+        num_blocks.append(tensor_size_new)
+
+        max_seg_size_new = (max_seg_sizes[-1] + threads_per_block - 1) // threads_per_block
+        max_seg_sizes.append(max_seg_size_new)
+
+    num_blocks.append(1)
+
+    output_tensors = []
+    id_tensors = []
+
+    for i,s in enumerate(tensor_sizes):
+        if i == 0:
+            if in_place:
+                output_tensor_new = values
+            else:
+                output_tensor_new = torch.clone(values, memory_format=torch.contiguous_format)
+
+            id_tensor_new = segment_ids
+
+        else:
+            output_tensor_new = torch.empty(size=(s,), device=values.device, dtype=values.dtype, memory_format=torch.contiguous_format)
+            id_tensor_new = torch.empty(size=(s,), device=segment_ids.device, dtype=segment_ids.dtype, memory_format=torch.contiguous_format)
+
+        output_tensors.append(output_tensor_new)
+        id_tensors.append(id_tensor_new)
+
+    # Define the kernel signatures
+    libsw_embedding.segcumsum_wrapper.argtypes = [
+        ctypes.c_int64,     # dtype_num
+        ctypes.c_void_p,  # values input/output pointer
+        ctypes.c_void_p,  # segment_ids pointer
+        ctypes.c_int64,     # size
+        ctypes.c_int64,     # max_seg_size
+        ctypes.c_void_p,  # block sums output pointer
+        ctypes.c_void_p,  # block last ids output pointer
+        ctypes.c_bool,    # return_next_level boolean
+        ctypes.c_int64,     # blocks
+        ctypes.c_int64,     # threads_per_block
+        ctypes.c_size_t   # shared_memory_size
+    ]
+    libsw_embedding.segcumsum_wrapper.restype = None
+
+    libsw_embedding.add_block_sums_wrapper.argtypes = [
+        ctypes.c_int64,     # dtype_num
+        ctypes.c_void_p,  # output pointer
+        ctypes.c_void_p,  # block_sums pointer
+        ctypes.c_void_p,  # segment_ids pointer
+        ctypes.c_void_p,  # block_last_id pointer
+        ctypes.c_int64,     # size
+        ctypes.c_int64,     # blocks
+        ctypes.c_int64      # threads_per_block
+    ]
+    libsw_embedding.add_block_sums_wrapper.restype = None
+
+    for i,s in enumerate(tensor_sizes):
+        return_next_level = ( i < (len(tensor_sizes) - 1) )
+
+        # Launch the segcumsum_wrapper
+        libsw_embedding.segcumsum_wrapper(
+            ctypes.c_int64(dtype_num),
+            ctypes.c_void_p(output_tensors[i].data_ptr()),
+            ctypes.c_void_p(id_tensors[i].data_ptr()),
+            ctypes.c_int64(tensor_sizes[i]),            
+            ctypes.c_int64(max_seg_sizes[i]),
+            ctypes.c_void_p(output_tensors[i+1].data_ptr() if return_next_level else 0),
+            ctypes.c_void_p(id_tensors[i+1].data_ptr() if return_next_level else 0),
+            ctypes.c_bool( return_next_level  ),
+            ctypes.c_int64(num_blocks[i]),
+            ctypes.c_int64(threads_per_block),
+            ctypes.c_size_t(shared_memory_size)
+        )
+
+
+    for i in reversed(range(len(tensor_sizes)-1)):
+
+        # Launch the add_block_sums_wrapper
+        libsw_embedding.add_block_sums_wrapper(
+            ctypes.c_int64(dtype_num),
+            ctypes.c_void_p(output_tensors[i].data_ptr()),
+            ctypes.c_void_p(output_tensors[i+1].data_ptr()),
+            ctypes.c_void_p(id_tensors[i].data_ptr()),
+            ctypes.c_void_p(id_tensors[i+1].data_ptr()),
+            ctypes.c_int64(tensor_sizes[i]),
+            ctypes.c_int64(num_blocks[i]),
+            ctypes.c_int64(threads_per_block)
+        )
+
+    return output_tensors[0]
+
+
+# This is a slow alternative of segcumsum() to verify the correctness of the results
+def segcumsum_slow(x, segment_ids):
+    out = torch.empty_like(x)
+
+    for i in range(len(x)):
+        if (i == 0):
+            out[i] = x[i]
+        elif segment_ids[i] == segment_ids[i-1]:
+            out[i] = out[i-1] + x[i]
+        else:
+            out[i] = x[i]
+    
+    return out
+
+
+# Returns the maximal number of threads per block supported by the CUDA device with the given index
+def get_max_threads_per_block(device_index):
+    libsw_embedding.get_max_threads_per_block.argtypes = [ ctypes.c_int ]
+    libsw_embedding.get_max_threads_per_block.restype = ctypes.c_int
+    return libsw_embedding.get_max_threads_per_block(ctypes.c_int(device_index))
 
 
 
