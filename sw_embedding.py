@@ -4,10 +4,11 @@
 # Technion Institute of Technology
 # Haifa, Israel
 
-version = '1.53'
-version_date = '2024-08-01'
+version = '1.54'
+version_date = '2024-08-02'
 
 # Changelog:
+# 1.54    speed up: 11 sec. / epoch; removed outdated code
 # 1.53    speed up: 12 sec. / epoch; before removing outdated code pieces
 # 1.52    speed up: 13 sec. / epoch
 # 1.51    Speed up: 17 sec. / epoch
@@ -37,6 +38,7 @@ version_date = '2024-08-01'
 #         Added type hinting and enforcement
 
 #TODO:
+# - In all sp. actions, make sure gradient of input is off
 # 1. Measure time for the sw_gnn and data creation phase. Especially converting edge_index to our format and coalescing()
 # 3. Time all backward functions
 # 5. See if time is wasted in repmat or if we can get rid of it
@@ -331,16 +333,7 @@ class SW_embedding(nn.Module):
                 assert arg.is_floating_point and not arg.is_complex, 'dtype must be real floating-point; instead got dtype=%s' % (arg)
 
         super().to(*args, **kwargs)       
-
-        # Note: We never rely on self.device internally. We just update it for the user.
-        # TODO: These are unsafe. If a parent module T has an SW_embedding as a submodule, e.g. T.swembed,
-        #       then calling T.to(dtype=something) does not recursively call T.swembed.to, but does recursively
-        #       change the dtype of the tensors in T.swmembed (e.g. projVecs, freqs). In this case, T.swembed.dtype
-        #       does not get updated to the true dtype (although T.swembed.get_dtype() does return the true dtype).
-        # Therefore I'm disabling them until I can ensure that they're always in a consistent state.
-        # self.device = self.get_device()
-        # self.dtype = self.get_dtype()
-        
+       
         return self
 
 
@@ -756,7 +749,7 @@ class SW_embedding(nn.Module):
 
 
             if cartesian_mode:
-                # TODO:
+                # Note:
                 # These repmats may be avoided if ag.sinc_cos_sparse could take freqs as a separate input, and broadcast all inputs accordingly.
                 # But sinc_diffs is of the same size as Wps and Wps_sum, so we could reduce the memory usage at most by 2/3, and only in cartesian mode.
                 # This may not worth the effort.
@@ -768,42 +761,20 @@ class SW_embedding(nn.Module):
             # Here we use the sum-to-product identity sin(2a)-sin(2b) = 2*sin(a-b)*cos(a+b)            
             # This formula probably leads to a loss of one significant digit, but it is much easier in the sparse case than using diff().
             
-            # Variant 1 is simpler to read, but requires more memory.
-            # Variant 2 is more memory efficient.
-            # Default: 2
+            # Variant 2 is more memory efficient
             variant = 2
 
             if variant == 1:
                 arg2 = np.pi * freqs * (2*Wps_sum - Wps)
                 del Wps_sum
                 assert_coalesced(arg2)
+
             elif variant == 2:                               
-                #assert_debug( (arg2.indices()==Wps.indices()).all(), '' )
-
-                # The command below is a more economic way of doing: arg2 = 2*Wps_sum - Wps
-                if False: # TODO: ORiginal
-                    # The two variants are equivalent and take the same time:
-                    var2 = 1
-                    if var2 == 1:
-                        # 0.06 seconds
-                        # TODO: Original
-                        arg2_vals = torch.add(-Wps.values(), Wps_sum.values(), alpha=2) # TODO: Use a sparse entrywise multiplication function here
-                        #arg2_vals = ag.add_same_pattern.apply(Wps, Wps_sum, -1, 2)
-                    elif var2 == 2:
-                        arg2_vals = 2*Wps_sum.values()-Wps.values()
-
-                    del Wps_sum
-                    arg2 = sp.sparse_coo_tensor_coalesced(indices=Wps.indices(), values=arg2_vals, size=Wps.shape)
-
                 arg2 = ag.add_same_pattern.apply(Wps, Wps_sum, -1, 2)
-
-
                 # 1.22 seconds
                 slice_info_freqs = sp.get_slice_info(arg2, sp.get_broadcast_dims_B_to_A(arg2, freqs))
                 # 0.15 seconds
                 arg2 = ag.mul_sparse_dense.apply(arg2, np.pi*freqs, slice_info_freqs)
-            else:
-                raise RuntimeError('This should not happen')
 
             # 0.14 seconds
             arg1 = ag.mul_sparse_dense.apply(Wps, freqs, slice_info_freqs)
@@ -817,32 +788,11 @@ class SW_embedding(nn.Module):
         # From here we only need sinc_diffs and Xps               
 
         if sparse_mode:
-            # TODO: If torch had a straightforward implementation of sparse-dense tensor product along an arbitrary dimension, it might be more efficient.
-
-            # print('sinc_diffs shape: ', sinc_diffs.shape, 'sinc_diffs is sparse: ', sinc_diffs.is_sparse)
-            # print('Xps shape: ', Xps.shape, 'Xps is sparse: ', Xps.is_sparse)
-            # print('element axis: ', element_axis)
-
-            #assert (Xps.shape == sinc_diffs.shape)
-            # TODO: Why do dinc_diffs and Xps have the same shape, and one of them is sparse and the other is dense? Maybe we can save time here?
-            # They are not
-
             if True:
                 # 1.4 seconds
                 slice_info_Xps = sp.get_slice_info(sinc_diffs, sp.get_broadcast_dims_B_to_A(sinc_diffs, Xps))
                 # 0.26 seconds
                 products = ag.mul_sparse_dense.apply(sinc_diffs, Xps, slice_info_Xps)
-
-            else:
-                # Very slow variant.
-                # Forward takes just 0.25 seconds, but backward takes a long time.
-                # TODO: Look for more instances where we do calculations on sparse .values() without handling backward explicitly.
-                inds_temp = sinc_diffs.indices()
-                bdims = sp.get_broadcast_dims_B_to_A(sinc_diffs, Xps)
-                inds_temp[bdims,:] = 0
-                products = sp.sparse_coo_tensor_coalesced(indices=sinc_diffs.indices(),
-                                                          values= sinc_diffs.values()*Xps[tuple(inds_temp)],
-                                                          size=sinc_diffs.shape)
 
             # 0.49 seconds
             product_sums = ag.sum_sparseToDense.apply(products, element_axis, slice_info_elements)
@@ -865,7 +815,7 @@ class SW_embedding(nn.Module):
 
     # Project W to the probability simplex. To be used in a Projected Gradient Descent scheme.
     @type_enforced.Enforcer(enabled=True)
-    def project_W(W : torch.Tensor, eps : float = 1e-8):
+    def project_W(W : torch.Tensor, eps : float = 1e-10):
         assert np.isfinite(eps), 'eps must be finite'
         assert not np.isnan(eps), 'eps cannot be NaN'
         assert eps >= 0, 'eps must be nonnegative'
@@ -891,7 +841,6 @@ class SW_embedding(nn.Module):
 
                 W = sp.sparse_coo_tensor_coalesced(indices=inds, values=vals, size=W.shape)
                 
-                # TODO: See if I can make this more efficient by calculating slice_info_elements somewhere else.
                 slice_info_W = sp.get_slice_info(W, -1) 
                 W_sum = ag.sum_sparseToDense.apply(W, -1, slice_info_W)
 
@@ -1074,31 +1023,22 @@ class ag:
 
     # Equivalent to: torch.unsqueeze(dim)
     class unsqueeze_sparse(torch.autograd.Function):
-        @staticmethod
+        @staticmethod        
         def forward(ctx, A, dim):
-            assert A.is_sparse, 'A must be sparse'
-            assert A.is_coalesced(), 'A must be coalesced'
+            assert_coalesced(A)
 
             # Note that here it is dim+A.dim()+1 rather than the usual dim + A.dim(), as defined in the unsqueeze() command
             ctx.dim = dim if dim >= 0 else ( dim + A.dim() + 1 )
             ctx.input_shape = A.shape
 
-            variant = 2
-
-            if variant == 1:
-                return A.unsqueeze(dim=dim)
+            vals = A.values()            
+            inds = A.indices()
+            inds = torch.cat( (inds[0:ctx.dim,:], torch.zeros((1,inds.shape[1]), device=inds.device, dtype=inds.dtype), inds[ctx.dim:,:]), dim=0 )
             
-            elif variant == 2:
-                assert_coalesced(A)
+            output_shape = ctx.input_shape[0:ctx.dim] + (1,) + ctx.input_shape[ctx.dim:]
 
-                vals = A.values()
-                
-                inds = A.indices()
-                inds = torch.cat( (inds[0:ctx.dim,:], torch.zeros((1,inds.shape[1]), device=inds.device, dtype=inds.dtype), inds[ctx.dim:,:]), dim=0 )
-
-                output_shape = ctx.input_shape[0:ctx.dim] + (1,) + ctx.input_shape[ctx.dim:]
-
-                return sp.sparse_coo_tensor_coalesced(indices=inds, values=vals, size=output_shape)
+            out = sp.sparse_coo_tensor_coalesced(indices=inds, values=vals, size=output_shape)
+            return out
 
 
         @staticmethod
@@ -1114,8 +1054,6 @@ class ag:
             vals = grad_output.values()
 
             grad_input = sp.sparse_coo_tensor_coalesced(indices=inds, values=vals, size=input_shape)
-            
-            # Note: If there was a torch.squeeze() for sparse tensors, we could have done this in one line.
 
             return grad_input, None
 
@@ -1128,16 +1066,7 @@ class ag:
             assert A.is_sparse, 'A must be sparse'
             assert A.is_coalesced(), 'A must be coalesced'
 
-            variant = 2
-
-            if variant == 1:
-                out = torch.sparse.sum(A, dim=dim).to_dense().unsqueeze(dim=dim)
-            elif variant == 2:
-                out = sp.sum_sparse(A, dim=dim, slice_info=slice_info).to_dense()
-            elif variant == 3:
-                s = list(A.shape)
-                s[dim] = 1
-                out = torch.ones(size=s, device=A.device, dtype=A.dtype)
+            out = sp.sum_sparse(A, dim=dim, slice_info=slice_info).to_dense()
 
             if ctx.needs_input_grad[0]:
                 ctx.dim = dim if dim >= 0 else ( dim + A.dim() )
@@ -1197,7 +1126,7 @@ class ag:
 
             if ctx.needs_input_grad[0]:
                 if a == 1.0:
-                    grad_A = grad_output.clone() # TODO: Do we need clone() here?
+                    grad_A = grad_output.clone()
                 else:
                     grad_A = sp.sparse_coo_tensor_coalesced(indices=grad_output.indices(), values=a*grad_output.values(), size=grad_output.shape)
             
@@ -1356,11 +1285,12 @@ class ag:
             broadcast_dims = ctx.broadcast_dims
             slice_info = ctx.slice_info
 
+            assert_coalesced(grad_output)
+
             out_A = out_B = None
         
-            if ctx.needs_input_grad[0]:
-                #TODO: Why do we need grad_output.to_sparse().coalesce()?
-                out_A = sp.div_sparse_dense(grad_output.to_sparse().coalesce(), B) # TODO: Check this for efficiency
+            if ctx.needs_input_grad[0]:                
+                out_A = sp.div_sparse_dense(grad_output, B)
             
             if ctx.needs_input_grad[1]:
                 # B is dense, so the gradient with respect to B should also be dense.
@@ -1375,56 +1305,6 @@ class ag:
                     out_B = sp.same_shape_prod(A, grad_output).to_dense() / (-torch.square(B))
                     assert False, "Did not test this case. Make sure this works correctly"
             return out_A, out_B, None
-
-
-
-    # Equivalent to: A*B, where A and B are sparse and are of the same shape and nonzero pattern
-    # TODO: Use mul_same_pattern instead
-    class mul_sparse(torch.autograd.Function):        
-        @staticmethod
-        def forward(ctx, A, B):
-            assert A.is_sparse and B.is_sparse
-            assert (A.shape == B.shape), 'A and B must have the same shape'
-            
-            assert_coalesced(A)
-            assert_coalesced(B)
-
-            if sw_embedding_debug_mode:
-                assert (A.indices() == B.indices()).all(), 'A and B nonzero indices do not match'
-
-            inds = A.indices()
-
-            A_vals = A.values()
-            B_vals = B.values()
-
-            out_vals = A_vals*B_vals
-
-            A_vals = A_vals if ctx.needs_input_grad[1] else None
-            B_vals = B_vals if ctx.needs_input_grad[0] else None
-
-            ctx.save_for_backward(A_vals, B_vals)
-            ctx.shape = A.shape
-            ctx.inds = inds
-
-            return sp.sparse_coo_tensor_coalesced(indices=inds, values=out_vals, size=A.shape)
-
-
-        @staticmethod
-        @once_differentiable
-        def backward(ctx, grad_output):
-            A_vals, B_vals = ctx.saved_tensors
-            shape = ctx.shape
-            inds = ctx.inds
-
-            out_A = out_B = None
-
-            ## 0.04 second for out_A and out_B together
-            if ctx.needs_input_grad[0]:
-                out_A = sp.sparse_coo_tensor_coalesced(indices=inds, values=B_vals*grad_output.values(), size=shape) 
-            if ctx.needs_input_grad[1]:
-                out_B = sp.sparse_coo_tensor_coalesced(indices=inds, values=A_vals*grad_output.values(), size=shape)
-
-            return out_A, out_B
 
 
 
@@ -1531,16 +1411,9 @@ class ag:
             elif grad_output.is_sparse:
                 assert False, 'This should not happen'
             else:
-                variant = 1 # 1 is the best
-                if variant == 1:
-                    # 0.089 seconds
-                    grad_input = torch.empty_like(grad_output)
-                    grad_input.scatter_(dim=dim, index=Xi.to(torch.int64), src=grad_output)
-                elif variant == 2:
-                    # 0.288 seconds
-                    Xi_inv = torch.argsort(Xi, dim=dim)
-                    del Xi
-                    grad_input = torch.gather(grad_output, dim=ctx.dim, index=Xi_inv)
+                # 0.089 seconds
+                grad_input = torch.empty_like(grad_output)
+                grad_input.scatter_(dim=dim, index=Xi.to(torch.int64), src=grad_output)
 
             return grad_input, None, None
 
@@ -1576,7 +1449,6 @@ class ag:
 
 
     # Replicates the sparse tensor A n times along the dimension dim
-    # Forward with variant 3: 1.7 seconds
     class repmat_sparse(torch.autograd.Function):
         @staticmethod
         def forward(ctx, A, n, dim):
@@ -1587,50 +1459,24 @@ class ag:
 
             assert_coalesced(A)
 
-            # Three different variants to yield the same result.
-            variant = 3 # no. 3 is the best
+            v = A.shape[dim] * torch.arange(n, device=A.device)
+            v = torch.repeat_interleave(v, A.values().numel(), dim=0)                
 
-            # Simplest formulation. Requires a lot of memory.
-            if variant == 1: # 3.5 seconds
-                out = torch.cat([A for _ in range(n)], dim=ctx.dim).coalesce()
-                return out
+            inds = A.indices().repeat([1,n])                
+            inds[dim,:] += v
+            del v
 
-            # Memory-efficient, simple formuation, but time-inefficient.
-            elif variant == 2:
-                out = A
-                for i in range(n-1):
-                    out = torch.cat([out, A])
+            vals = A.values().repeat([n,])
 
-            # Memory and time efficient.
-            elif variant == 3: # 1.6 seconds 
-                v = A.shape[dim] * torch.arange(n, device=A.device)
+            out_shape = list(A.shape)
+            out_shape[dim] = n*out_shape[dim]
 
-                # Two variants. The first is simpler, but empirically their running time is almost identical.
-                if True:
-                    v = torch.repeat_interleave(v, A.values().numel(), dim=0)
-                else:
-                    v = torch.kron(v, torch.ones(A.values().numel(), device=v.device, dtype=v.dtype))
+            del A
 
-                inds = A.indices().repeat([1,n])                
-                inds[dim,:] += v
-                del v
+            inds2, vals2 = sp.sort_inds_vals(inds, vals, out_shape, ensure_unique=True)
+            del inds, vals
 
-                vals = A.values().repeat([n,])
-
-                out_shape = list(A.shape)
-                out_shape[dim] = n*out_shape[dim]
-
-                del A
-
-                inds2, vals2 = sp.sort_inds_vals(inds, vals, out_shape, ensure_unique=True)
-                del inds, vals
-
-                out = sp.sparse_coo_tensor_coalesced(indices=inds2, values=vals2, size=out_shape)
-                return out
-
-            else:
-                raise RuntimeError('This should not happen')
-
+            out = sp.sparse_coo_tensor_coalesced(indices=inds2, values=vals2, size=out_shape)
             return out
 
 
@@ -1644,18 +1490,10 @@ class ag:
                 inds = grad_output.indices().clone()
                 inds[ctx.dim] = torch.remainder(inds[ctx.dim], ctx.shape[ctx.dim])
 
-                # Variant 2 does not work
-                variant = 1
-
                 # 0 seconds
-                if variant == 1:
-                    grad_input = torch.sparse_coo_tensor(indices=inds, values=grad_output.values(), size=ctx.shape)
-                    # Here we must coalesce
-                    grad_input = grad_input.coalesce()
-
-                elif variant == 2:
-                    grad_input = torch.empty(ctx.shape, device=grad_output.device, dtype=grad_output.dtype)
-                    grad_input = torch.scatter_add(grad_output.values(), inds, out=grad_input)
+                grad_input = torch.sparse_coo_tensor(indices=inds, values=grad_output.values(), size=ctx.shape)
+                # Here we must coalesce
+                grad_input = grad_input.coalesce()
 
             else:
                 grad_input = None
@@ -1931,8 +1769,8 @@ class sp:
         keys_sorted, sort_inds = torch.sort(keys, dim=0, stable=True)
         del keys
 
-        # variant 1 is probably better
-        variant = 1
+        # variant 2 is roughly twice faster
+        variant = 2
 
         if variant == 1:
             one = torch.ones(1, device=keys_sorted.device, dtype=keys_sorted.dtype)
@@ -2014,7 +1852,7 @@ class sp:
             # If we're in backward mode, do not invert
             perm_invs = perms
         else:
-                # Variant 2 is slightly faster
+                # Variant 2 is faster
                 variant = 2
 
                 if variant == 1:
@@ -2046,11 +1884,10 @@ class sp:
     # Returns a tensor of the same size as x, containing the values of d/dx sinc(x)
     def dsinc(x, return_sinc=False):
         with torch.enable_grad():
-            x2 = x.clone().detach() # TODO: Not sure this .clone() is needed, but removing it saves little time anyway
+            x2 = x.clone().detach() # Not sure this .clone() is needed, but removing it saves little time anyway
             x2.requires_grad = True
             y = torch.sinc(x2)
             grad_sinc_out = torch.ones_like(y)
-            #grad_sinc_out = torch.ones([1,]*y.dim(), device=y.device, dtype=torch.int64).expand_as(y)
             dy = torch.autograd.grad(y, x2, grad_sinc_out, create_graph=False)[0]
 
         if return_sinc:
@@ -2180,8 +2017,10 @@ def segcumsum_cuda(values, segment_ids, max_seg_size, in_place):
 
     n = values.numel()
 
+    # TODO: Get this number at initialization
     # Determine the maximal number of threads per block supported in the current CUDA device
-    cuda_max_threads_per_block = get_max_threads_per_block(values.device.index)
+    # cuda_max_threads_per_block = get_max_threads_per_block(values.device.index)
+    cuda_max_threads_per_block = 256
 
     # Take the smallest multiple of 32 greater or equal to the input size, but no less than 64
     num_threads_2 = max(64, (n+31)//32)
@@ -2307,10 +2146,12 @@ def segcumsum_slow(x, segment_ids):
 
 
 # Returns the maximal number of threads per block supported by the CUDA device with the given index
-def get_max_threads_per_block(device_index):
+# Note: This function may take ~0.7 seconds to run
+def get_max_threads_per_block(device_index):    
     libsw_embedding.get_max_threads_per_block.argtypes = [ ctypes.c_int ]
     libsw_embedding.get_max_threads_per_block.restype = ctypes.c_int
-    return libsw_embedding.get_max_threads_per_block(ctypes.c_int(device_index))
+    out = libsw_embedding.get_max_threads_per_block(ctypes.c_int(device_index))
+    return out
 
 
 
