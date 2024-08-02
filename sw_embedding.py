@@ -4,10 +4,11 @@
 # Technion Institute of Technology
 # Haifa, Israel
 
-version = '1.54'
-version_date = '2024-08-02'
+version = '1.55'
+version_date = '2024-08-03'
 
 # Changelog:
+# 1.55    speed up: 10 sec. / epoch; removed outdated code
 # 1.54    speed up: 11 sec. / epoch; removed outdated code
 # 1.53    speed up: 12 sec. / epoch; before removing outdated code pieces
 # 1.52    speed up: 13 sec. / epoch
@@ -1452,31 +1453,57 @@ class ag:
     class repmat_sparse(torch.autograd.Function):
         @staticmethod
         def forward(ctx, A, n, dim):
-            ctx.dim = dim if dim >= 0 else ( dim + A.dim() )
+            dim = dim if dim >= 0 else ( dim + A.dim() )
+            assert (dim >= 0) and (dim < A.dim())
+            
+            ctx.dim = dim
             ctx.shape = A.shape
 
             dim = ctx.dim
 
             assert_coalesced(A)
 
-            v = A.shape[dim] * torch.arange(n, device=A.device)
-            v = torch.repeat_interleave(v, A.values().numel(), dim=0)                
+            # Important: Variant 1 is better, in that it keeps the output vector sorted if dim=-1, so
+            #            in that case there is no need to coalesce()
+            #            Variant 2 might keep the vector sorted if dim=0, but I did not test it
+            # The code below assumes that if dim=-1, the output tensor does not need to be sorted.
+            # Changing this from variant=1 to variant=2 will break this assumption and thus the correctness of the code.
+            # But using variant 2 only when dim=0 may help avoid coalesce() in that case as well. I just need to check that it works correctly in that case.
+            variant = 1
 
-            inds = A.indices().repeat([1,n])                
-            inds[dim,:] += v
-            del v
+            if variant == 1:
+                v = A.shape[dim] * torch.arange(n, device=A.device)
+                v = v.repeat(A.values().numel())
 
-            vals = A.values().repeat([n,])
+                inds = A.indices().repeat_interleave(repeats=n, dim=1)
 
-            out_shape = list(A.shape)
-            out_shape[dim] = n*out_shape[dim]
+                inds[dim,:] += v
+                del v
+
+                vals = A.values().repeat_interleave(repeats=n, dim=0)
+
+                out_shape = list(A.shape)
+                out_shape[dim] = n*out_shape[dim]
+
+            elif variant == 2:
+                v = A.shape[dim] * torch.arange(n, device=A.device)
+                v = torch.repeat_interleave(v, A.values().numel(), dim=0)                
+
+                inds = A.indices().repeat([1,n])                
+                inds[dim,:] += v
+                del v
+
+                vals = A.values().repeat([n,])
+
+                out_shape = list(A.shape)
+                out_shape[dim] = n*out_shape[dim]
 
             del A
 
-            inds2, vals2 = sp.sort_inds_vals(inds, vals, out_shape, ensure_unique=True)
-            del inds, vals
+            if dim != len(ctx.shape)-1:
+                inds, vals = sp.sort_inds_vals(inds, vals, out_shape, ensure_unique=True)              
 
-            out = sp.sparse_coo_tensor_coalesced(indices=inds2, values=vals2, size=out_shape)
+            out = sp.sparse_coo_tensor_coalesced(indices=inds, values=vals, size=out_shape)
             return out
 
 
@@ -1764,14 +1791,22 @@ class sp:
         dims2 = [d for d in range(len(shape)) if not d in dim]
         shape2 = [shape[d] for d in range(len(shape)) if not d in dim]
 
-        # 0.795 seconds
         keys = sp.ravel_index(inds[dims2,:], tuple(shape2)).view(-1)
-        keys_sorted, sort_inds = torch.sort(keys, dim=0, stable=True)
+
+
+        variant = 1
+        if variant == 1:
+            # 2.74 seconds
+            keys_sorted, sort_inds = torch.sort(keys, dim=0, stable=True)
+        elif variant == 2:
+            # Note: If there is a memory problem, try to use this variant
+            sort_inds = torch.empty_like(keys)
+            keys_sorted, sort_inds = torch.sort(keys, dim=0, stable=True, out=(keys, sort_inds))
         del keys
+
 
         # variant 2 is roughly twice faster
         variant = 2
-
         if variant == 1:
             one = torch.ones(1, device=keys_sorted.device, dtype=keys_sorted.dtype)
 
