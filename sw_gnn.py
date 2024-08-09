@@ -8,7 +8,7 @@ import torch_geometric as pyg
 from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import add_self_loops, degree
 
-from sw_embedding import SW_embedding, minimize_mutual_coherence
+from sw_embedding import SW_embedding, minimize_mutual_coherence, ag, sp
 
 class SW_conv(MessagePassing):
     # in_channels:    dimension of input vertex features
@@ -34,6 +34,11 @@ class SW_conv(MessagePassing):
     #                   if set to zero and an empty neighborhood is encountered, this will lead to a runtime error.
     #                   Default: 1
     #
+    # edge_weighting:   weighting scheme for the graph edges
+    #                   options: 'unit': all edges get unit weight; 'gcn': weighting according to the GCN scheme; see [a]
+    #                   Default: 'unit'
+    #                   [a] https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.nn.conv.GCNConv.html
+    #
     # bias:           if set to true, the MLP uses a bias vector.
     #                 to make the model scale equivariant (i.e. positively homogeneous) with respect to the vertex features, set 
     #                 all of <bias>, <batchNorm_final>, <batchNorm_hidden> to False, and use a scale-equivariant activation
@@ -51,6 +56,14 @@ class SW_conv(MessagePassing):
     #                 activation function to be used at the output of the final and hidden MLP layers.
     #                 if set to None, does not apply an activation
     #                 Defaults: Leaky ReLU with a negative slope of 0.2
+    #
+    # mlp_init:       initialization scheme for the MLP's linear layers. 
+    #                 options: None / 'xavier_uniform' / 'xavier_normal' / 'kaiming_normal' / 'kaiming_uniform'
+    #                 takes effect only if mlp_layers > 0. biases are always initialized to zero.
+    #                 None: default PyTorch nn.linear initialization (similar to Kaiming Uniform / He)
+    #                 'xavier_uniform' / 'xavier_normal' : Xavier (a.k.a. Glorot) initialization with uniform / normal entries
+    #                 'kaiming_uniform' / 'kaiming_normal' : Kaiming (a.k.a. He) initialization with uniform / normal entries
+    #                 Default: None
     #
     # batchNorm_final, batchNorm_hidden:
     #                 Tell whether to apply batch normalization to the outputs of the final and hidden layers.
@@ -70,12 +83,15 @@ class SW_conv(MessagePassing):
                  mlp_layers=1, mlp_hidden_dim=None,
                  mlp_activation_final = torch.nn.LeakyReLU(negative_slope=0.2), 
                  mlp_activation_hidden = torch.nn.LeakyReLU(negative_slope=0.2), 
+                 mlp_init = None,
                  batchNorm_final = False, batchNorm_hidden = False,
                  dropout_final = 0, dropout_hidden = 0,
-                 self_loop_weight = 1,
+                 self_loop_weight = 1, edge_weighting = 'unit',
                  device=None, dtype=torch.float32):
         
         super().__init__(aggr=None)
+
+        assert edge_weighting in {'unit', 'gcn'}, 'invalid value passed in argument <edge_weighting>'
 
         if mlp_hidden_dim is None:
             mlp_hidden_dim = max(in_channels, out_channels)
@@ -89,6 +105,7 @@ class SW_conv(MessagePassing):
         embed_bias = (bias and mlp_layers == 0)
         
         self.concat_self = concat_self
+        self.edge_weighting = edge_weighting
         self.self_loop_weight = self_loop_weight
 
         # if mlp_layers=0, mlp_input_dim is used also to determine the size of the dimensionality-reduction matrix
@@ -117,7 +134,27 @@ class SW_conv(MessagePassing):
                 bn_curr = batchNorm_final if i == mlp_layers-1 else batchNorm_hidden
                 dropout_curr = dropout_final if i == mlp_layers-1 else dropout_hidden
 
-                mlp_modules.append( torch.nn.Linear(in_curr, out_curr, bias=bias, device=device, dtype=dtype) )
+                layer_new = torch.nn.Linear(in_curr, out_curr, bias=bias, device=device, dtype=dtype)                
+
+                # Apply initialization
+                if mlp_init is None:
+                    # do nothing
+                    pass
+                elif mlp_init == 'xavier_uniform':
+                    torch.nn.init.xavier_uniform_(layer_new.weight)
+                elif mlp_init == 'xavier_normal':
+                    torch.nn.init.xavier_normal_(layer_new.weight)
+                elif mlp_init == 'kaiming_uniform':
+                    torch.nn.init.kaiming_uniform_(layer_new.weight)
+                elif mlp_init == 'kaiming_normal':
+                    torch.nn.init.kaiming_normal_(layer_new.weight)
+                else:
+                    raise RuntimeError('Invalid value passed at argument mlp_init')
+
+                if (mlp_init is not None) and bias:
+                    torch.nn.init.zeros_(layer_new.bias)
+
+                mlp_modules.append( layer_new )
 
                 if bn_curr:
                     mlp_modules.append( torch.nn.BatchNorm1d(num_features=out_curr, device=device, dtype=dtype) ) 
@@ -163,9 +200,9 @@ class SW_conv(MessagePassing):
 
         # Convert edge_index to sparse adjacency matrix
         if True:
-            adj = SW_conv.edge_index_to_adj(edge_index, num_vertices=n, dtype=vertex_features.dtype, self_loop_weight=self.self_loop_weight)
+            adj, in_degrees = SW_conv.edge_index_to_adj(edge_index, num_vertices=n, dtype=vertex_features.dtype, edge_weighting=self.edge_weighting, self_loop_weight=self.self_loop_weight)
             
-        else:
+        else: # old code
             adj = pyg.utils.to_torch_coo_tensor(edge_index, edge_attr=None, size=n, is_coalesced=False)
             adj = adj.to(vertex_features.dtype)
             adj.requires_grad_(False)
@@ -178,8 +215,6 @@ class SW_conv(MessagePassing):
                 adj.coalesce()                
             else:
                 adj.coalesce()
-
-        in_degrees = torch.sum(adj, dim=-1, keepdim=True).to_dense()
         
         # Aggregate neighboring vertex features
         emb = self.sw_embed(X=vertex_features, W=adj, graph_mode=True, serialize_num_slices=None)
@@ -210,7 +245,7 @@ class SW_conv(MessagePassing):
         pass
 
 
-    def edge_index_to_adj(edge_index, num_vertices, dtype, self_loop_weight=0):
+    def edge_index_to_adj(edge_index, num_vertices, dtype, self_loop_weight=0, edge_weighting='unit'):
         num_edges = edge_index.shape[1]
 
         inds = edge_index
@@ -226,6 +261,27 @@ class SW_conv(MessagePassing):
         adj = torch.sparse_coo_tensor(indices=inds, values=vals)            
         adj = adj.coalesce()
 
-        return adj
+        # old code:
+        #in_degrees = torch.sum(adj, dim=-1, keepdim=True).to_dense()
+
+        slice_info_W = sp.get_slice_info(adj, -1)
+        in_degrees = ag.sum_sparseToDense.apply(adj, -1, slice_info_W)
+
+        if edge_weighting == 'unit':
+            pass # do nothing
+
+        elif edge_weighting == 'gcn':
+            in_degrees_sqrt = torch.sqrt(in_degrees)
+            adj = ag.div_sparse_dense.apply(adj, in_degrees_sqrt, slice_info_W)
+            adj = ag.div_sparse_dense.apply(adj, in_degrees_sqrt.transpose(-1,-2), slice_info_W)
+
+            # Note: This weighting scheme only considers in-degrees.
+            #       Once can use a directed-graph variant by replacing the line above with
+            #out_degrees = ag.sum_sparseToDense.apply(adj, -2, slice_info_W)
+            #adj = ag.div_sparse_dense.apply(adj, torch.sqrt(out_degrees), slice_info_W)
+        else:
+            raise RuntimeError('Invalid weighting method passed in argument <edge_weighting>')
+            
+        return adj, in_degrees
         
 
