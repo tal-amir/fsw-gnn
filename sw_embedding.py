@@ -4,8 +4,33 @@
 # Technion Institute of Technology
 # Haifa, Israel
 
-version = '1.6'
-version_date = '2024-08-03'
+version = '2.0'
+version_date = '2024-08-19'
+
+# Total-mass encoding and regularization:
+#
+# Check the whole thing again for speed and memory efficiency
+#
+# - Always verify that W does not contain negative values. Unless maybe if some flag is turned off.
+#
+# Edge features:
+# - Do not split self.projVecs. Do self.projVecs.shape[1] == d + d_edge.
+# - Allow projVecs.shape[0] == m-1, with the first dimension being the size encoding.
+#
+#
+# Conditions:
+# - Edge features are used iff d_edge > 0
+# - Edge features are only allowed in graph mode
+# - An input X_edge is expected in forward(). Its default is None, and a tensor with numel()==0 is also treated as None.
+# - X_edge.shape == (<W.shape>, d_edge)
+#   X_edge is sparse iff W is sparse. If sparse, its dense dimension must equal 1, and its nonzero pattern must match that of W. It must be coalesced (as is W).
+# - W cannot be None. It is 'unit' by default, and can also be 'uniform'.
+
+#
+# TODO:
+# 1. Support custom weight decay (penalize only projVecs)
+# 2. Add support for zero-sized output along any possible dimension (flat input corresponding to empty multisets, m=0)
+# 3. Accelerate by explicitly computing W, W_sum and W_cumsum when W='uniform' or 'unit'
 
 # Changelog:
 # 1.6     finished optimizing code
@@ -135,9 +160,14 @@ class SW_embedding(nn.Module):
     
     @type_enforced.Enforcer(enabled=True)
     def __init__(self, 
-                 d : int, m : int | None = None,
+                 d : int, # ambient dimension of input multisets / measures
+                 m : int | None = None, # embedding output dimension
                  nSlices : int | None = None, nFreqs : int | None = None, collapse_freqs : bool = False,
-                 learnable_slices : bool = False, learnable_freqs : bool = False,
+                 d_edge : int = 0, # dimension of edge feature vectors. requires calling forward() with graph_mode=True
+                 encode_total_mass : bool = False, # Tells whether to encode the input multiset sizes (a.k.a. total mass) in the embedding
+                 total_mass_encoding_method : str = 'plain', # 'plain' / 'homog' / 'homog_alt'
+                 total_mass_pad_thresh : float | int = 1.0, # Multisets/mesaures with a total mass below that threshold get padded with the complementary mass placed at x=0
+                 learnable_slices : bool = False, learnable_freqs : bool = False, learnable_powers : bool = False,
                  freqs_init : float | int | str | tuple[float,float] = 'random',
                  minimize_slice_coherence : bool = False,
                  enable_bias : bool = True,
@@ -148,25 +178,53 @@ class SW_embedding(nn.Module):
         super().__init__()
 
         # Process sizes
-        self.d = d
+        assert d >= 0, 'd must be nonnegative'
+        assert d_edge >= 0, 'd_edge must be nonnegative'
 
-        input_space_name = 'R^%d' % (self.d)
+        self.d = d
+        self.d_edge = d_edge
+
+        self.encode_total_mass = encode_total_mass
+        self.total_mass_encoding_dim = 1 if self.encode_total_mass else 0
+
+        total_mass_pad_thresh = float(total_mass_pad_thresh)
+        assert not np.isinf(total_mass_pad_thresh), 'total_mass_pad_thresh cannot be inf'
+        assert not np.isnan(total_mass_pad_thresh), 'total_mass_pad_thresh cannot be NaN'        
+        assert total_mass_pad_thresh > 0, 'total_mass_pad_thresh must be positive'
+
+        self.total_mass_pad_thresh = total_mass_pad_thresh
+
+        assert total_mass_encoding_method in {'plain','homog','homog_alt'}, '<total_mass_encoding_method> must be one of \'plain\', \'homog\', \'homog_alg\''
+        self.total_mass_encoding_method = total_mass_encoding_method
+
+        if self.d_edge == 0:
+            input_space_name = 'R^%d' % (self.d)
+        else:
+            input_space_name = 'R^(%d+%d)' % (self.d, self.d_edge)
 
         if (m is not None) and (nSlices is None) and (nFreqs is None):
             self.cartesian_mode = False            
+            self.collapse_freqs = False
             self.m = m
-            self.nSlices = m
-            self.nFreqs = m
+            self.nSlices = m - self.total_mass_encoding_dim
+            self.nFreqs = m - self.total_mass_encoding_dim
             output_space_name = 'R^%d' % (self.m)
+
         elif (m is None) and (nSlices is not None) and (nFreqs is not None):
+            assert collapse_freqs or (not encode_total_mass), 'Cartesian mode with collapse_freqs=False is not supported when encode_total_mass=True'
+
             self.cartesian_mode = True
+            self.collapse_freqs = collapse_freqs
             self.nSlices = nSlices
             self.nFreqs = nFreqs
-            self.m = nSlices * nFreqs
-            self.collapse_freqs = collapse_freqs
+            self.m = nSlices * nFreqs + self.total_mass_encoding_dim
             output_space_name = ('R^%d' % (self.m)) if self.collapse_freqs else ('R^(%d\u00d7%d)' % (self.nSlices, self.nFreqs))
+
         else:
-            assert False, "Expected exactly one of (m != None) or (nSlices and nFreqs != None)"
+            assert False, "Expected exactly one of (m != None) or (nSlices != None and nFreqs != None)"
+
+        assert self.m >= 0, 'm must be nonnegative'
+        assert (self.m >= 1) or (not self.encode_total_mass), 'm must be >= 1 when encode_total_mass=True'
 
         m = self.m
         nSlices = self.nSlices
@@ -176,6 +234,7 @@ class SW_embedding(nn.Module):
 
         self.learnable_slices = learnable_slices
         self.learnable_freqs = learnable_freqs
+        self.learnable_powers = learnable_powers
 
         # Note: freqs_init is checked for correctness downstream at generate_embedding_parameters()
         self.freqs_init = freqs_init
@@ -200,7 +259,7 @@ class SW_embedding(nn.Module):
         qprintln(report, 'Technion Institute of Technology, Haifa, Israel')
 
         qprintln(report)
-        qprintln(report, 'Based on our paper titled "Injective Sliced Wasserstrin Embedding for Multisets and Weighted Point Clouds", 2024')
+        qprintln(report, 'Based on our paper titled "Fourier Sliced-Wasserstrin Embedding for Multisets and Distributions", 2024')
 
         qprintln(report)
         qprintln(report, 'Constructing embedding for sets in %s into %s  ' % (input_space_name, output_space_name))
@@ -284,9 +343,11 @@ class SW_embedding(nn.Module):
 
         # Generate projection vectors and frequencies
         # We always generate (and optimize) them in float64 and then convert to the desired dtype.
-        projVecs, freqs, bias = SW_embedding.generate_embedding_parameters(d=self.d, 
+        projVecs, freqs, bias = SW_embedding.generate_embedding_parameters(d=self.d+self.d_edge, 
                                                                            nSlices=self.nSlices, nFreqs=self.nFreqs,
                                                                            cartesian_mode=self.cartesian_mode,
+                                                                           collapse_freqs=self.collapse_freqs,
+                                                                           total_mass_encoding_dim=self.total_mass_encoding_dim,
                                                                            freqs_init=self.freqs_init,
                                                                            minimize_slice_coherence=self.minimize_slice_coherence,
                                                                            device=device,
@@ -341,7 +402,8 @@ class SW_embedding(nn.Module):
     
 
 
-    def generate_embedding_parameters(d, nSlices, nFreqs, cartesian_mode, freqs_init, minimize_slice_coherence, device, report, report_on_coherence_minimization):
+    def generate_embedding_parameters(d, nSlices, nFreqs, cartesian_mode, collapse_freqs, total_mass_encoding_dim,
+                                      freqs_init, minimize_slice_coherence, device, report, report_on_coherence_minimization):
         dtype_init = torch.float64
 
         # Axis number for the ambient space R^d
@@ -424,7 +486,13 @@ class SW_embedding(nn.Module):
             assert not torch.isnan(freqs).any(), "Found nans in freqs"
 
         # C. Generate bias vector. Always initialized to zero.
-        bias_shape = (nSlices, nFreqs) if cartesian_mode else (nSlices,)
+        if cartesian_mode and not collapse_freqs:
+            bias_shape = (nSlices, nFreqs)
+        elif cartesian_mode and collapse_freqs:
+            bias_shape = (nSlices*nFreqs + total_mass_encoding_dim,)
+        else:
+            bias_shape = (nSlices + total_mass_encoding_dim,)
+
         bias = torch.zeros(size=bias_shape, dtype=dtype_init, device=device)
 
         qprintln(report)
@@ -457,7 +525,8 @@ class SW_embedding(nn.Module):
 
     # Forward: 8 seconds, backward: 1.73 seconds
     @type_enforced.Enforcer(enabled=True)
-    def forward(self, X, W=None, graph_mode : bool = False, serialize_num_slices : int | None = None):
+    def forward(self, X : torch.Tensor, W : torch.Tensor | str = 'unit', X_edge : torch.Tensor | None = None, 
+                graph_mode : bool = False, serialize_num_slices : int | None = None):
         # Simple use:
         # X sized (n,d) represents a multiset of n points in R^d.
         # If W sized (n,) is provided, then (X,W) represents a distribution, with each point X[i,:]
@@ -507,8 +576,10 @@ class SW_embedding(nn.Module):
 
         ### A. Verify input types and content
 
+        assert self.total_mass_pad_thresh > 0, 'total_mass_pad_thresh must be positive'
+        
         assert torch.is_tensor(X), 'X must be a pytorch tensor. Instead got type %s' % (type(X))
-        assert W is None or torch.is_tensor(W), 'W must be a pytorch tensor. Instead got type %s' % (type(W))
+        assert torch.is_tensor(W) or W in {'unit', 'uniform'}, 'W must be a pytorch tensor, \'unit\' or \'uniform\''
         assert X.dtype == self.get_dtype(), ( "X has the wrong dtype. Expected %s, got %s" % (self.get_dtype(), X.dtype) )
         assert X.device == self.get_device(), ( "X is on the wrong device. Expected %s, got %s" % (self.get_device(), X.device) )
 
@@ -516,15 +587,16 @@ class SW_embedding(nn.Module):
             assert not torch.isnan(X).any(), "The entries of X cannot contain NaNs"
             assert not torch.isinf(X).any(), "All entries of X must be finite"
 
-        if W is not None:
+        if torch.is_tensor(W):
             # Check if W is sparse. If so, ensure that W is of the correct layout.            
             # Note: Strangely enough, sparse tensors of layouts other than COO (e.g. CSR) may have is_sparse=False.
             #       This may lead us to mistakenly treat a, e.g. W that is sparse CSR as dense.
-            #       Currently there is no is_dense() function in torch, so reading the layout string directly is the 2nd best.
+            #       Currently there is no is_dense() function in torch, so reading the layout string directly is the second best.
             if W.is_sparse or W.layout != torch.strided:
                 assert W.layout == torch.sparse_coo, ( "Sparse W has an unsupported sparsity layout '%s'. Only the COO layout (torch.sparse_coo) is currently supported." % (W.layout) )
 
                 assert W.is_coalesced(), 'Sparse W must be coalesced'
+                assert W.dense_dim() == 0, 'W.dense_dim() must be zero'
 
                 if sw_embedding_basic_safety_checks:
                     W_vals = W.values()
@@ -543,7 +615,12 @@ class SW_embedding(nn.Module):
                 if W.requires_grad and (W_vals == 0).any():
                     warnings.warn('Gradients of W may be incorrect at indices where W=0. Use W = SW_embedding.project_W(W, eps) with eps > 0')
 
-
+        if self.d_edge > 0:
+            assert graph_mode, 'd_edge > 0 (given at initialization) necessitates graph_mode=True on forward call'
+            assert X_edge is not None, 'X_edge must be provided since d_edge > 0'
+        else:
+            assert X_edge is None, 'X_edge should be None (d_edge == 0)'
+        
 
         ### B. Verify input sizes
             
@@ -555,7 +632,7 @@ class SW_embedding(nn.Module):
             batch_dims = tuple(X.shape[0:-2])
             n = X.shape[len(batch_dims)]
 
-            if W is not None:
+            if torch.is_tensor(W):
                 if (len(W.shape) == len(X.shape)) and (W.shape[-1] == X.shape[-2]) and (W.shape[0:-2] == X.shape[0:-2]):
                     err_str = "Shape mismatch between X and W: If X.shape = (b1,b2,...,bk,n,d) then W.shape should be (b1,b2,...,bk,n) (Perhaps missing argument graph_mode=True?)"
                 else:
@@ -563,12 +640,16 @@ class SW_embedding(nn.Module):
                 
                 assert (len(W.shape) == len(X.shape)-1) and (W.shape == X.shape[0:-1]), err_str
 
-            else:
-                # Initialize with uniform weights
+            elif W == 'unit':
+                # Initialize with unit weights
                 W = torch.ones(batch_dims + (n,), dtype=self.get_dtype(), device=self.get_device())
 
+            elif W == 'uniform':
+                # Initialize with uniform weights
+                W = torch.full(batch_dims + (n,), 1.0/n, dtype=self.get_dtype(), device=self.get_device())
+
         elif graph_mode:
-            assert W is not None, 'W must be explicitly provided when graph_mode=True'
+            assert torch.is_tensor(W), 'W must be explicitly provided when graph_mode=True'
 
             # batch_dims contains everything that precedes (nRecipients, n) in W.shape
             batch_dims = tuple(W.shape[0:-2])
@@ -593,28 +674,51 @@ class SW_embedding(nn.Module):
         freq_axis     = proj_axis +1 if self.cartesian_mode else proj_axis
         output_proj_axis = element_axis # In the output, the element axis is replaced by the projection axis
 
-        output_shape_before_collapse =  batch_dims + (nRecipients,) if graph_mode else batch_dims
-        output_shape_before_collapse += (self.nSlices, self.nFreqs) if self.cartesian_mode else (self.m, )
+        output_shape_before_collapse_and_totmass_augmentation =  batch_dims + (nRecipients,) if graph_mode else batch_dims
+        output_shape_before_collapse_and_totmass_augmentation += (self.nSlices, self.nFreqs) if self.cartesian_mode else (self.nSlices, )
 
         ### D. Input is ok. Start working.
 
-        # Normalize W
+        # Calculate W_sum, which contains the total mass of the input measures
         if W.is_sparse:
             slice_info_W = sp.get_slice_info(W, -1)
             W_sum = ag.sum_sparseToDense.apply(W, -1, slice_info_W)
-            W = ag.div_sparse_dense.apply(W, W_sum, slice_info_W)
-            del slice_info_W
-
-        else:
-            W_sum = torch.sum(W, dim=-1, keepdim=True)
-            W = W / W_sum
         
-        assert (W_sum > 0).all(), "W assigns an all-zero weight to one of its distributions"
-        del W_sum
+        else:
+            W_sum = torch.sum(W, dim=-1, keepdim=True)            
+
+        # Total-mass deficit to be compensated for by padding
+        W_pad = ag.custom_lowclamp.apply(self.total_mass_pad_thresh-W_sum, 0.0)
+
+        # Detect weight deficit and augment W and X accordingly
+        if (W_pad > 0).any():
+            zshape = list(X.shape)
+            zshape[-2] = 1
+            X = torch.cat( (X, torch.zeros(zshape, device=X.device, dtype=X.dtype)), dim=-2 )               
+
+            if W.is_sparse:
+                W = ag.concat_sparse.apply(W, W_pad.to_sparse())
+                slice_info_W = sp.get_slice_info(W, -1)
+            else:
+                W = torch.cat( (W, W_pad), dim=-1 )
+
+            W_sum_padded = ag.custom_lowclamp.apply(W_sum, self.total_mass_pad_thresh)
+        else:            
+            W_sum_padded = W_sum
+        
+        del W_pad
+
+        # Normalize W according to W_sum_padded
+        if W.is_sparse:
+            W = ag.div_sparse_dense.apply(W, W_sum_padded, slice_info_W)          
+            del slice_info_W, W_sum_padded
+        else:
+            W = W / W_sum_padded
+            del W_sum_padded
 
         # For compatibility reasons, we support the case of zero-dimensional output tensor
         if self.m == 0:
-            X_emb = torch.zeros(size=output_shape_before_collapse, dtype=self.get_dtype(), device=self.get_device())
+            X_emb = torch.zeros(size=output_shape_before_collapse_and_totmass_augmentation, dtype=self.get_dtype(), device=self.get_device())
 
         elif (serialize_num_slices is None) or (serialize_num_slices >= self.nSlices):
             X_emb = SW_embedding.forward_helper(X, W, self.projVecs, self.freqs, graph_mode, self.cartesian_mode, batch_dims)
@@ -624,7 +728,7 @@ class SW_embedding(nn.Module):
 
             nIter = (self.nSlices // serialize_num_slices) if (self.nSlices % serialize_num_slices == 0) else (1 + self.nSlices // serialize_num_slices)
 
-            X_emb = torch.empty(size=output_shape_before_collapse, dtype=self.get_dtype(), device=self.get_device())
+            X_emb = torch.empty(size=output_shape_before_collapse_and_totmass_augmentation, dtype=self.get_dtype(), device=self.get_device())
 
             for iIter in range(nIter):
                 inds_curr = torch.arange(iIter*serialize_num_slices, min( self.nSlices, (iIter+1)*serialize_num_slices), dtype=torch.int64, device=self.get_device())
@@ -637,12 +741,22 @@ class SW_embedding(nn.Module):
         if self.cartesian_mode and self.collapse_freqs:
             X_emb = torch.flatten(X_emb, start_dim=element_axis, end_dim=element_axis+1)
 
+        if self.encode_total_mass:
+            if self.total_mass_encoding_method == 'plain':
+                X_emb = torch.cat( (W_sum, X_emb), dim=-1)
+            elif self.total_mass_encoding_method == 'homog':
+                X_emb_norm = torch.mean(X_emb.abs(), dim=-1, keepdim=True)
+                X_emb = torch.cat( (W_sum * X_emb_norm, X_emb), dim=-1)
+            elif self.total_mass_encoding_method == 'homog_alt':
+                X_emb_norm = torch.mean(X_emb.abs(), dim=-1, keepdim=True)
+                X_emb = torch.cat( (SW_embedding.total_mass_homog_alt_encoding_part1(W_sum) * X_emb_norm,
+                                    SW_embedding.total_mass_homog_alt_encoding_part2(W_sum) * X_emb), dim=-1)            
+            else:
+                raise RuntimeError('This should not happen')
+
         # Add bias
         if self.enable_bias:
-            # Output bias shape before broadcasting
-            bias_out_shape = (1,)*(X_emb.dim()-self.bias.dim()) + tuple(self.bias.shape)
-            bias_reshape = torch.reshape(self.bias, bias_out_shape)            
-            X_emb += bias_reshape
+            X_emb += self.bias
 
         return X_emb
 
@@ -877,6 +991,16 @@ class SW_embedding(nn.Module):
         return mu
 
 
+
+    @type_enforced.Enforcer(enabled=True)
+    def total_mass_homog_alt_encoding_part1(totmass : torch.Tensor):
+        out = torch.where(totmass <= 1, totmass*(2-totmass), 1)
+        return out
+
+    @type_enforced.Enforcer(enabled=True)
+    def total_mass_homog_alt_encoding_part2(totmass : torch.Tensor):
+        out = torch.where(totmass <= 1, totmass.square(), 2*totmass-1)
+        return out
 
 #############################################################################################################
 ##                                                  Tools                                                  ##
@@ -1306,6 +1430,71 @@ class ag:
 
 
 
+    class add_sparse_dense(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, A, B, slice_info):
+            assert A.is_sparse, 'A must be sparse'
+            assert not B.is_sparse, 'B cannot be sparse'
+            assert (torch.logical_or(torch.tensor(A.shape) == torch.tensor(B.shape), torch.tensor(B.shape) == 1)).all(), "B must be of size that allows broadcasting to A"
+            assert A.is_coalesced(), 'A must be coalesced'
+
+            # Calculate broadcast dimensions
+            broadcast_dims = sp.get_broadcast_dims_B_to_A(A, B)
+
+            # Perform entrywise addition
+            vals = A.values() + B.expand_as(A)[tuple(A.indices())]
+
+            # Create the output sparse tensor with the same indices as A
+            out = sp.sparse_coo_tensor_coalesced(indices=A.indices(), values=vals, size=A.shape)
+
+            A_save = A if ctx.needs_input_grad[1] else None
+            B_save = B if ctx.needs_input_grad[0] else None
+
+            if True in ctx.needs_input_grad:
+                ctx.save_for_backward(A_save, B_save)
+                ctx.broadcast_dims = broadcast_dims
+                ctx.slice_info = slice_info if ctx.needs_input_grad[1] else None 
+
+            return out
+
+        @staticmethod
+        @once_differentiable
+        def backward(ctx, grad_output):
+            A, B = ctx.saved_tensors
+            broadcast_dims = ctx.broadcast_dims
+            slice_info = ctx.slice_info
+
+            out_A = out_B = None
+
+            if ctx.needs_input_grad[0]:
+                # Gradient with respect to the sparse tensor A is simply the grad_output
+                out_A = grad_output
+            
+            if ctx.needs_input_grad[1]:
+                # Gradient with respect to the dense tensor B
+                if len(broadcast_dims) > 0:
+                    # If broadcasting happened, we need to sum over the broadcast dimensions
+                    out_B = sp.sum_sparse(grad_output, dim=broadcast_dims, slice_info=slice_info).to_dense()
+                else:
+                    # No broadcasting needed, so just convert to dense
+                    out_B = grad_output.to_dense()
+
+            return out_A, out_B, None
+
+
+    # Calculates the function f(x) = max(x, thresh), but with grad f(thresh) = 1
+    class custom_lowclamp(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, input, thresh):
+            ctx.active = (input >= thresh)
+            return torch.clamp(input, min=thresh)
+        
+        @staticmethod
+        def backward(ctx, grad_output):
+            grad_input = torch.where(ctx.active, grad_output, torch.zeros_like(grad_output))
+            return grad_input, None
+
+
     # Equivalent to torch.sinc(A) * torch.cos(B), where A and B are spase tensors of the same shape and nonzero pattern.
     class sinc_cos_sparse(torch.autograd.Function):
         @staticmethod
@@ -1372,7 +1561,79 @@ class ag:
             return grad_A, grad_B
 
 
+    # Concatenates two sparse tensors along their last dimension, similarly to
+    # torch.cat((A,B), dim=-1)
+    class concat_sparse(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, A, B):
+            # Ensure both A and B are sparse and coalesced
+            assert A.is_sparse and A.is_coalesced(), "A must be a coalesced sparse tensor"
+            assert B.is_sparse and B.is_coalesced(), "B must be a coalesced sparse tensor"
+            assert (A.dim() == B.dim()) and (A.shape[:-1] == B.shape[:-1]), "A and B must have the same shape except for the last dimension"
 
+            # Get the indices and values of A and B
+            A_indices, A_values = A.indices(), A.values()
+            B_indices, B_values = B.indices(), B.values()
+
+            # Calculate the offset for indices of B
+            offset = A.shape[-1]
+            new_B_indices = B_indices.clone()
+            new_B_indices[-1, :] += offset
+
+            # Concatenate indices and values
+            combined_indices = torch.cat([A_indices, new_B_indices], dim=1)
+            combined_values = torch.cat([A_values, B_values], dim=0)
+
+            # Get the size of the resulting sparse tensor
+            combined_size = list(A.shape)
+            combined_size[-1] += B.shape[-1]
+
+            # Create the output sparse tensor and coalesce it
+            combined_indices, combined_values = sp.sort_inds_vals(combined_indices, combined_values, combined_size) 
+            C = sp.sparse_coo_tensor_coalesced(combined_indices, combined_values, combined_size)
+
+            # Save information for backward pass
+            ctx.A_shape = A.shape
+            ctx.B_shape = B.shape
+
+            return C
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            A_shape = ctx.A_shape
+            B_shape = ctx.B_shape
+
+            if not (True in ctx.needs_input_grad):
+                return None, None
+
+            assert grad_output.is_coalesced(), 'If for some reason we get an uncoalesced grad_output here, we should check why and if justified, coalesce it.'
+
+            # Extracting the indices and values from grad_output
+            grad_indices = grad_output.indices()
+            grad_values = grad_output.values()
+
+            if ctx.needs_input_grad[0]:
+                A_mask = grad_indices[-1, :] < A_shape[-1]
+                grad_A_indices = grad_indices[:, A_mask]
+                grad_A_values = grad_values[A_mask]
+                grad_A = sp.sparse_coo_tensor_coalesced(grad_A_indices, grad_A_values, size=A_shape)
+                del A_mask, grad_A_indices, grad_A_values
+            else:
+                grad_A = None
+
+            if ctx.needs_input_grad[1]:
+                B_mask = grad_indices[-1, :] >= A_shape[-1]
+                grad_B_indices = grad_indices[:, B_mask]
+                grad_B_indices[-1, :] -= A_shape[-1]
+                grad_B_values = grad_values[B_mask]
+                grad_B = sp.sparse_coo_tensor_coalesced(grad_B_indices, grad_B_values, size=B_shape)
+                del B_mask, grad_B_indices, grad_B_values
+            else:
+                grad_B = None
+
+            return grad_A, grad_B
+
+            
     # Equivalent to torch.sort(X, dim=dim, descending=descending)
     class sort(torch.autograd.Function):
         @staticmethod
@@ -1499,7 +1760,7 @@ class ag:
 
             # If dim=-1 or 0, and the correct variant was used, then inds are already sorted.
             if dim not in (0, len(ctx.shape)-1):
-                inds, vals = sp.sort_inds_vals(inds, vals, out_shape, ensure_unique=True)              
+                inds, vals = sp.sort_inds_vals(inds, vals, out_shape)
 
             out = sp.sparse_coo_tensor_coalesced(indices=inds, values=vals, size=out_shape)
             return out
@@ -1549,7 +1810,7 @@ class sp:
     # returns a coalesced copy of A assuming that the indices of A are unique but just possibly unsorted
     def coalesce_unique(A):
         A_shape = A.shape
-        inds2, vals2 = sp.sort_inds_vals(indices=A._indices(), values=A._values(), shape=A.shape, ensure_unique=True)
+        inds2, vals2 = sp.sort_inds_vals(indices=A._indices(), values=A._values(), shape=A.shape)
         del A
         return sp.sparse_coo_tensor_coalesced(inds2, vals2, size=A_shape)
 
@@ -1618,7 +1879,7 @@ class sp:
 
     # Sort indices and values. Similar to coalesce(), but does not assume nor impose uniqueness.
     # 2.93 seconds
-    def sort_inds_vals(indices, values, shape=None, ensure_unique=False):
+    def sort_inds_vals(indices, values, shape=None):
         if shape is None:
             shape, _ = torch.max(indices, dim=1)
             shape += 1
@@ -1792,13 +2053,14 @@ class sp:
 
         inds[dim, :] = A.shape[dim] - inds[dim, :] - 1
 
-        inds2, vals2 = sp.sort_inds_vals(inds, vals, shape=A.shape, ensure_unique=True)
+        inds2, vals2 = sp.sort_inds_vals(inds, vals, shape=A.shape)
         out = sp.sparse_coo_tensor_coalesced(indices=inds2, values=vals2, size=A.shape)
         return out
 
 
 
-    def get_slice_info(A, dim):
+    def get_slice_info(A, dim, calc_nnz_per_slice=False):
+        # TODO: Make sure we run this with no gradients to ensure speed
         assert A.is_sparse, "input tensor must be sparse"
         assert_coalesced(A)
         
@@ -1824,6 +2086,7 @@ class sp:
                 keys = torch.zeros(1, device=inds.device, dtype=inds.dtype).expand(A.values().numel())
         else:
             keys = sp.ravel_index(inds[dims2,:], tuple(shape2)).view(-1)
+
 
         variant = 1
 
@@ -1864,7 +2127,7 @@ class sp:
             del _
 
             slice_ends = counts_consecutive.cumsum(dim=0)-1
-            max_slice_nonzeros = int(torch.max(counts_consecutive))
+            max_slice_nonzeros = int(torch.max(counts_consecutive))            
 
         slice_info = { 'shape': shape,
                       'dims': dim,
@@ -1873,7 +2136,20 @@ class sp:
                     'slice_ends': slice_ends,
                     'num_slices': slice_ends.numel(),
                     'max_slice_nonzeros': max_slice_nonzeros}
-        
+
+
+        if calc_nnz_per_slice:
+            # TODO: Make sure this works
+            one = torch.ones(1, device=inds.device, dtype=torch.float64)
+            vals = one.repeat(A.values().numel())
+            A_mask = sp.sparse_coo_tensor_coalesced(indices=inds, values=vals, size=A.shape)
+            nnz_per_slice = sp.sum_sparse(A_mask, dim, slice_info=slice_info).to_dense().to(torch.int64)
+            del A_mask
+            
+            slice_info['nnz_per_slice'] = nnz_per_slice
+        else: 
+            slice_info['nnz_per_slice'] = None
+
         return slice_info
 
 
@@ -1951,7 +2227,7 @@ class sp:
         inds[dim,:] = perm_invs.expand_as(A)[tuple(A._indices())]
 
         # 1.45 seconds
-        inds2, vals2 = sp.sort_inds_vals(inds, A._values(), shape=A.shape, ensure_unique=True)
+        inds2, vals2 = sp.sort_inds_vals(inds, A._values(), shape=A.shape)
         del inds, perms, perm_invs
 
         out = sp.sparse_coo_tensor_coalesced(indices=inds2, values=vals2, size=A.shape)
