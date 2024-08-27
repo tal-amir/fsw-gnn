@@ -4,19 +4,11 @@
 # Technion Institute of Technology
 # Haifa, Israel
 
-version = '2.02a'
+version = '2.03a'
 version_date = '2024-08-27'
 
-# Total-mass encoding and regularization:
-#
-# Check the whole thing again for speed and memory efficiency
-#
-# - Always verify that W does not contain negative values. Unless maybe if some flag is turned off.
-#
 # Edge features:
 # - Do not split self.projVecs. Do self.projVecs.shape[1] == d_in + d_edge.
-# - Allow projVecs.shape[0] == d_out-1, with the first dimension being the size encoding.
-#
 #
 # Conditions:
 # - Edge features are used iff d_edge > 0
@@ -24,19 +16,18 @@ version_date = '2024-08-27'
 # - An input X_edge is expected in forward(). Its default is None, and a tensor with numel()==0 is also treated as None.
 # - X_edge.shape == (<W.shape>, d_edge)
 #   X_edge is sparse iff W is sparse. If sparse, its dense dimension must equal 1, and its nonzero pattern must match that of W. It must be coalesced (as is W).
-# - W cannot be None. It is 'unit' by default, and can also be 'uniform'.
 
-#
 # TODO:
-# 1. Support custom weight decay (penalize only projVecs)
 # 2. Add support for zero-sized output along any possible dimension (flat input corresponding to empty multisets, d_out=0)
 # 3. Accelerate by explicitly computing W, W_sum and W_cumsum when W='uniform' or 'unit'
-# 4. Import cuda code only when required?
-# 5. Rename the argument d_out to dim_out or embed_dim. Perhaps all over the code.
-#    Rename d to d_in.
+# 5. For safety, in all functions under the class sp that return sparse tensors, make sure gradient of input is off
 # 6. Make sure that the state_dict saves all the embedding parameters, not just the pytorch tensors (e.g. encode_total_mass).
+# 7. Implement custom .state_dict() and .load_state_dict() methods, which should save and load accompanyting non-tensor parameters,
+#    upon loading update required_grads of tensors according to .learnable_projs, .learnable_freqs, and allow initializing a model
+#    directly from a saved state_dict.
 
 # Changelog:
+# 2.03a   can handle failed loading of custom CUDA library
 # 2.02a   more efficient gradient handling in permute_sparse; renamed dimension variable names d, m to d_in, d_out
 # 2.01a   added safety mechanisms to detect uncoanesced tensors
 # 2.0a    low total-mass padding; total-mass encoding
@@ -70,8 +61,6 @@ version_date = '2024-08-27'
 # 1.21    Added reset_parameters()
 #         Added type hinting and enforcement
 
-#TODO:
-# - For safety, in all functions under the class sp that return sparse tensors, make sure gradient of input is off
 
 
 import numpy as np
@@ -95,7 +84,9 @@ import ctypes
 # Load the segcumsum shared library from the same directory as the current file
 mydir = os.path.dirname(os.path.abspath(__file__))
 libfsw_embedding_path = os.path.join(mydir, "libfsw_embedding.so")
-libfsw_embedding = ctypes.CDLL(libfsw_embedding_path)
+# This library will be loaded at FSW_embedding.__init__()
+libfsw_embedding = None
+#libfsw_embedding = ctypes.CDLL(libfsw_embedding_path)
 
 
 # Turn this on to run some verifications and sanity checks during runtime.
@@ -178,10 +169,25 @@ class FSW_embedding(nn.Module):
                  minimize_slice_coherence : bool = False,
                  enable_bias : bool = True,
                  device : torch.device | int | str | None = None, dtype : torch.dtype = torch.float32, 
-                 report : bool = False,
+                 load_custom_cuda_lib = True,
+                 report : bool = False, user_warnings : bool = True,
                  report_on_coherence_minimization : bool = False):
 
         super().__init__()
+
+        self.user_warnings = user_warnings
+
+        # Load custom CUDA library
+        global libfsw_embedding
+        if load_custom_cuda_lib and (libfsw_embedding is None):            
+            try:
+                libfsw_embedding = ctypes.CDLL(libfsw_embedding_path)
+                qprintln(report, 'Loaded custom CUDA library \'%s\'' % (libfsw_embedding_path))
+            except OSError as e:
+                if self.user_warnings:
+                    warnings.warn('Could not load custom CUDA library \'%s\'. Using pure torch implementation. (To silence, set user_warnings=False at FSW_embedding() init)' % (libfsw_embedding_path), UserWarning)
+                libfsw_embedding = None
+                # raise RuntimeError('Error loading custom CUDA library \'%s\'. Disable by setting load_custom_cuda_lib=False at FSW_embedding() init.' % (libfsw_embedding_path))
 
         # Process sizes
         assert d_in >= 0, 'd_in must be nonnegative'
@@ -587,7 +593,14 @@ class FSW_embedding(nn.Module):
         ### A. Verify input types and content
 
         assert self.total_mass_pad_thresh > 0, 'total_mass_pad_thresh must be positive'
-        
+
+        if self.d_edge > 0:
+            assert graph_mode, 'd_edge > 0 (given at initialization) necessitates graph_mode=True on forward call'
+            assert X_edge is not None, 'X_edge must be provided since d_edge > 0'            
+        else:
+            assert (X_edge is None) or (X_edge.numel() == 0), 'X_edge should be None or empty since d_edge == 0'
+            X_edge = None
+
         assert torch.is_tensor(X), 'X must be a pytorch tensor. Instead got type %s' % (type(X))
         assert torch.is_tensor(W) or W in {'unit', 'uniform'}, 'W must be a pytorch tensor, \'unit\' or \'uniform\''
         assert X.dtype == self.get_dtype(), ( "X has the wrong dtype. Expected %s, got %s" % (self.get_dtype(), X.dtype) )
@@ -598,6 +611,9 @@ class FSW_embedding(nn.Module):
             assert not torch.isinf(X).any(), "All entries of X must be finite"
 
         if torch.is_tensor(W):
+            assert W.dtype == self.get_dtype(), ( "W has the wrong dtype. Expected %s, got %s" % (self.get_dtype(), W.dtype) )
+            assert W.device == self.get_device(), ( "W is on the wrong device. Expected %s, got %s" % (self.get_device(), W.device) )
+
             # Check if W is sparse. If so, ensure that W is of the correct layout.            
             # Note: Strangely enough, sparse tensors of layouts other than COO (e.g. CSR) may have is_sparse=False.
             #       This may lead us to mistakenly treat a, e.g. W that is sparse CSR as dense.
@@ -614,20 +630,38 @@ class FSW_embedding(nn.Module):
                 if fsw_embedding_basic_safety_checks:
                     W_vals = W
 
-            assert W.dtype == self.get_dtype(), ( "W has the wrong dtype. Expected %s, got %s" % (self.get_dtype(), W.dtype) )
-            assert W.device == self.get_device(), ( "W is on the wrong device. Expected %s, got %s" % (self.get_device(), W.device) )
-
             if fsw_embedding_basic_safety_checks:
                 assert not torch.isnan(W_vals).any(), "W cannot contain NaNs"
                 assert not torch.isinf(W_vals).any(), "All entries of W must be finite"
                 assert (W_vals >= 0).all(), "All entries of W must be nonnegative"
+                del W_vals
 
-        if self.d_edge > 0:
-            assert graph_mode, 'd_edge > 0 (given at initialization) necessitates graph_mode=True on forward call'
-            assert X_edge is not None, 'X_edge must be provided since d_edge > 0'
-        else:
-            assert X_edge is None, 'X_edge should be None (d_edge == 0)'
-        
+        if X_edge is not None:
+            assert torch.is_tensor(W), 'When X_edge is provided, W must be provided explicitly'
+            assert (X_edge.device == self.get_device()), ( "X_edge is on the wrong device. Expected %s, got %s" % (self.get_device(), X_edge.device) )
+            assert (X_edge.dtype == self.get_dtype()), ( "X_edge has the wrong dtype. Expected %s, got %s" % (self.get_dtype(), X.dtype) )        
+
+            if X_edge.is_sparse or X_edge.layout != torch.strided:
+                assert X_edge.layout == torch.sparse_coo, ( "Sparse X_edge has an unsupported sparsity layout '%s'. Only the COO layout (torch.sparse_coo) is currently supported." % (X_edge.layout) )
+
+                assert X_edge.is_coalesced(), 'Sparse X_edge must be coalesced'
+                assert X_edge.dense_dim() in (0,1), 'X_edge.dense_dim() must be 1 or 0'
+                assert (self.d_edge > 1) or (X_edge.dense_dim() == 1), 'X_edge.dense_dim() must be 1 since d_edge > 1'
+
+                if fsw_embedding_basic_safety_checks:
+                    X_edge_vals = X_edge.values()
+            else:
+                if fsw_embedding_basic_safety_checks:
+                    X_edge_vals = X_edge
+
+            if fsw_embedding_basic_safety_checks:
+                assert not torch.isnan(X_edge_vals).any(), "X_edge_vals cannot contain NaNs"
+                assert not torch.isinf(X_edge_vals).any(), "All entries of X_edge_vals must be finite"
+                assert (X_edge_vals >= 0).all(), "All entries of X_edge_vals must be nonnegative"
+                del X_edge_vals
+
+            assert X_edge.is_sparse == W.is_sparse, 'X_edge and W must either both or neither be sparse'
+
 
         ### B. Verify input sizes
             
@@ -664,6 +698,21 @@ class FSW_embedding(nn.Module):
             n = W.shape[-1]
 
             assert (len(W.shape) == len(X.shape)) and (W.shape[-1] == X.shape[-2]) and (W.shape[0:-2] == X.shape[0:-2]), "Shape mismatch between X and W: When graph_mode=True, if W.shape = (b1,b2,...,bk,nRecipients,n) then X.shape should be (b1,b2,...,bk,n,d_in)"
+
+            if X_edge is not None:
+                # Verify that X_edge has the right shape and is compatible with W
+                assert (((self.d_edge == 1) and (X_edge.shape == W.shape)) or 
+                    ((X_edge.dim() == W.dim()+1) and (X_edge.shape[0:-1] == W.shape) and (X_edge.shape[-1] == self.d_edge))), (
+                    "Shape mismatch between X_edge and W: if W.shape = (b1,b2,...,bk,nRecipients,n) then X.shape should be (b1,b2,...,bk,nRecipients,n,d_edge) (with the possible exception (b1,b2,...,bk,nRecipients,n) when d_edge=1" )
+                
+                if X_edge.is_sparse:
+                    assert X_edge.values().numel() == W.values().numel(), 'Sparse X_edge must have the same number of values() as W'
+                    if fsw_embedding_basic_safety_checks:
+                        assert (X_edge.indices() == W.indices()).all(), 'Sparse X_edge must have the same nonzero pattern as W'
+                    
+                # TODO: In both sparse and dense cases, if X_edge is squeezed to the same shape as W, unsqueeze it to (W.shape, d_edge)/
+                #       If sparse, the unsqueeze should take place along a dense dimension. Write an autograd function for that.
+
 
 
 
@@ -728,7 +777,7 @@ class FSW_embedding(nn.Module):
             X_emb = torch.zeros(size=output_shape_before_collapse_and_totmass_augmentation, dtype=self.get_dtype(), device=self.get_device())
 
         elif (serialize_num_slices is None) or (serialize_num_slices >= self.nSlices):
-            X_emb = FSW_embedding.forward_helper(X, W, self.projVecs, self.freqs, graph_mode, self.cartesian_mode, batch_dims)
+            X_emb = FSW_embedding.forward_helper(X, W, self.projVecs, self.freqs, graph_mode, X_edge, self.cartesian_mode, batch_dims)
 
         else:
             assert isinstance(serialize_num_slices, int) and (serialize_num_slices >= 1), 'serialize_num_slices must be None or a positive integer'
@@ -742,7 +791,7 @@ class FSW_embedding(nn.Module):
                 projVecs_curr = self.projVecs[inds_curr,:]
                 freqs_curr = self.freqs if self.cartesian_mode else self.freqs[inds_curr]
                 
-                out_curr = FSW_embedding.forward_helper(X, W, projVecs_curr, freqs_curr, graph_mode, self.cartesian_mode, batch_dims)                
+                out_curr = FSW_embedding.forward_helper(X, W, projVecs_curr, freqs_curr, graph_mode, X_edge, self.cartesian_mode, batch_dims)                
                 assign_at(X_emb, out_curr, output_proj_axis, inds_curr)
 
         if self.cartesian_mode and self.collapse_freqs:
@@ -769,7 +818,7 @@ class FSW_embedding(nn.Module):
 
 
     # 9.7 seconds
-    def forward_helper(X, W, projVecs, freqs, graph_mode, cartesian_mode, batch_dims):
+    def forward_helper(X, W, projVecs, freqs, graph_mode, X_edge, cartesian_mode, batch_dims):
         # This function computes the embedding of (X,W) for a subset of the projections and frequencies.
         # projVecs should be of size (num_projections x d_in), and freqs should be of size nFreqs (not nFreqs x 1).
 
@@ -778,6 +827,7 @@ class FSW_embedding(nn.Module):
         nProjs = projVecs.shape[0]
         nFreqs = len(freqs)
         sparse_mode = W.is_sparse
+        d_edge = X_edge.shape[-1] if X_edge is not None else None
 
         assert len(freqs.shape) == 1, "This should not happen"
         assert (len(projVecs.shape) == 2) and (projVecs.shape[1] == d_in), "This should not happen"
@@ -786,6 +836,8 @@ class FSW_embedding(nn.Module):
         Xp = torch.tensordot(X, projVecs, dims=((-1,),(1,)))
 
         del X
+
+        # TODO: Add X_edge code here
 
         # Sort the projected elements 
         # Note: We sort before the graph-mode expansion because it makes things simpler in the case when W is sparse
@@ -933,60 +985,6 @@ class FSW_embedding(nn.Module):
         del product_sums
 
         return out
-
-
-
-    # Project W to the probability simplex. To be used in a Projected Gradient Descent scheme.
-    @type_enforced.Enforcer(enabled=True)
-    def project_W(W : torch.Tensor, eps : float = 1e-10):
-        assert np.isfinite(eps), 'eps must be finite'
-        assert not np.isnan(eps), 'eps cannot be NaN'
-        assert eps >= 0, 'eps must be nonnegative'
-
-        assert torch.is_floating_point(W), 'W must be a floating-point tensor'
-
-        requires_grad_input = W.requires_grad
-
-        # We don't want these actions to be recorded in the computation graph
-        with torch.no_grad():
-            if W.is_sparse or W.layout != torch.strided:
-                assert W.layout == torch.sparse_coo, ( "Sparse W has an unsupported sparsity layout '%s'. Only the COO layout (torch.sparse_coo) is currently supported." % (W.layout) )
-
-                assert W.is_coalesced(), 'Sparse W must be coalesced'
-                inds = W.indices()
-                vals = W.values()
-
-                if fsw_embedding_basic_safety_checks:
-                    assert not torch.isinf(vals).any(), 'W cannot contain infinite values'
-                    assert not torch.isnan(vals).any(), 'W cannot contain NaNs'
-
-                vals = torch.clamp(vals, min=eps)
-
-                W = sp.sparse_coo_tensor_coalesced(indices=inds, values=vals, size=W.shape)
-                
-                slice_info_W = sp.get_slice_info(W, -1) 
-                W_sum = ag.sum_sparseToDense.apply(W, -1, slice_info_W)
-
-                if fsw_embedding_basic_safety_checks:
-                    assert not (W_sum == 0).any(), "W assigns an all-zero weight to one of its distributions"
-
-                W = ag.div_sparse_dense.apply(W, W_sum, slice_info_W)
-                del slice_info_W
-            
-            else:
-                if fsw_embedding_basic_safety_checks:
-                    assert not torch.isinf(W).any(), 'W cannot contain infinite values'
-                    assert not torch.isnan(W).any(), 'W cannot contain NaNs'
-
-                W = torch.clamp(W, min=eps)
-
-                if fsw_embedding_basic_safety_checks:
-                    assert (W > 0).any(dim=-1).all(), "W assigns an all-zero weight to one of its distributions"
-
-                W = W / torch.sum(W, dim=-1, keepdim=True)
-
-            W.requires_grad = requires_grad_input
-            return W
 
 
 
@@ -2435,7 +2433,9 @@ def segcumsum(values, segment_ids, max_seg_size=None, in_place=False, thorough_v
         assert not torch.isnan(values).any(), "Found nans in ''values''"
 
     # Calculate and return the segmented cumsum
-    if (values.device.type == 'cuda') and (not always_use_pure_torch):
+    global libfsw_embedding
+
+    if (values.device.type == 'cuda') and (not always_use_pure_torch) and (libfsw_embedding is not None):
         return segcumsum_cuda(values, segment_ids, max_seg_size, in_place)
     else:
         return segcumsum_torch(values, segment_ids, max_seg_size, in_place)
@@ -2471,6 +2471,8 @@ def segcumsum_cuda(values, segment_ids, max_seg_size, in_place):
     # Note: This is automatically capped by the maximal number supported by the architecture.
     # Set to an arbitrarily large number (e.g. 1e6) to determine automatically.
     max_num_threads_per_block = 1e6
+
+    assert libfsw_embedding is not None, 'libfsw_embedding library is not loaded'
 
     assert values.device.type == 'cuda', 'the tensor ''values'' must be on a CUDA device'
     assert segment_ids.device.type == 'cuda', 'the tensor ''segment_ids'' must be on a CUDA device'
