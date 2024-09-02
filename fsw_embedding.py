@@ -4,7 +4,7 @@
 # Technion Institute of Technology
 # Haifa, Israel
 
-version = '2.1'
+version = '2.11'
 version_date = '2024-00-02'
 
 # Edge features:
@@ -32,6 +32,7 @@ version_date = '2024-00-02'
 #    directly from a saved state_dict.
 
 # Changelog:
+# 2.11    fixed sparse padding bug
 # 2.1     added full edge-feature support
 # 2.09a   edge feature support is working (beta)
 # 2.03a   can handle failed loading of custom CUDA library
@@ -760,7 +761,8 @@ class FSW_embedding(nn.Module):
             X = torch.cat( (X, torch.zeros(zshape, device=X.device, dtype=X.dtype)), dim=-2 )               
 
             if W.is_sparse:
-                W_pad = W_pad.to_sparse()
+                # Make sure this works
+                W_pad = sp.to_sparse_full(W_pad)
                 W = ag.concat_sparse.apply(W, W_pad)
                 slice_info_W = sp.get_slice_info(W, -1)
 
@@ -768,7 +770,7 @@ class FSW_embedding(nn.Module):
                     X_edge_pad_inds = W_pad.indices()
                     X_edge_pad_vals = torch.zeros( (nRecipients, self.d_edge), device=X.device, dtype=X.dtype)
                     X_edge_pad_shape = replace_in_tuple(tuple(X_edge.shape), -2, 1)
-                   
+
                     X_edge_pad = sp.sparse_coo_tensor_coalesced(indices=X_edge_pad_inds, values=X_edge_pad_vals, size = X_edge_pad_shape)
                     X_edge = ag.concat_sparse.apply(X_edge, X_edge_pad)
             else:
@@ -2269,6 +2271,23 @@ class sp:
             B = torch.sparse_coo_tensor(indices=A.indices(), values=A.values(), size=A.shape).coalesce()
             assert (B.indices() == A.indices()).all(), 'verify_coalescence: index mismatch in input'
             assert (B.values() == A.values()).all(), 'verify_coalescence: value mismatch in input'
+
+
+
+    # Takes an input dense tensor A and returns a sparse tensor that contains *all* entries in A, including zeros
+    def to_sparse_full(A):
+        assert not A.is_sparse, 'A should be dense'
+
+        # Get the indices of all elements
+        indices = torch.nonzero(torch.ones_like(A), as_tuple=False).t()
+
+        # Flatten the dense tensor to create values for all elements, including zeros
+        values = A.flatten()
+
+        # Create the sparse tensor, including all values
+        out = sp.sparse_coo_tensor_coalesced(indices, values, size=A.shape)
+
+        return out
 
 
 
