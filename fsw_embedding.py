@@ -4,8 +4,8 @@
 # Technion Institute of Technology
 # Haifa, Israel
 
-version = '2.03a'
-version_date = '2024-08-27'
+version = '2.09a'
+version_date = '2024-00-02'
 
 # Edge features:
 # - Do not split self.projVecs. Do self.projVecs.shape[1] == d_in + d_edge.
@@ -18,6 +18,8 @@ version_date = '2024-08-27'
 #   X_edge is sparse iff W is sparse. If sparse, its dense dimension must equal 1, and its nonzero pattern must match that of W. It must be coalesced (as is W).
 
 # TODO:
+# 0. Support d_in=0
+# 1. If d_in+d_edge=1, all proj vecs should equal 1.
 # 2. Add support for zero-sized output along any possible dimension (flat input corresponding to empty multisets, d_out=0)
 # 3. Accelerate by explicitly computing W, W_sum and W_cumsum when W='uniform' or 'unit'
 # 5. For safety, in all functions under the class sp that return sparse tensors, make sure gradient of input is off
@@ -27,6 +29,7 @@ version_date = '2024-08-27'
 #    directly from a saved state_dict.
 
 # Changelog:
+# 2.09a   edge feature support is working (beta)
 # 2.03a   can handle failed loading of custom CUDA library
 # 2.02a   more efficient gradient handling in permute_sparse; renamed dimension variable names d, m to d_in, d_out
 # 2.01a   added safety mechanisms to detect uncoanesced tensors
@@ -91,7 +94,7 @@ libfsw_embedding = None
 
 # Turn this on to run some verifications and sanity checks during runtime.
 # If an error is encountered, a runtime error is raised
-fsw_embedding_debug_mode = False
+fsw_embedding_debug_mode = True
 
 # Conduct basic safety checks, mainly on the user input.
 # Recommended to leave True, unless running time is of utmost importance, and the input is known to be consistent.
@@ -185,7 +188,7 @@ class FSW_embedding(nn.Module):
                 qprintln(report, 'Loaded custom CUDA library \'%s\'' % (libfsw_embedding_path))
             except OSError as e:
                 if self.user_warnings:
-                    warnings.warn('Could not load custom CUDA library \'%s\'. Using pure torch implementation. (To silence, set user_warnings=False at FSW_embedding() init)' % (libfsw_embedding_path), UserWarning)
+                    warnings.warn('Could not load custom CUDA library \'%s\'. Using pure torch implementation, which is a bit slower. (To silence, set user_warnings=False at FSW_embedding() init)' % (libfsw_embedding_path), UserWarning)
                 libfsw_embedding = None
                 # raise RuntimeError('Error loading custom CUDA library \'%s\'. Disable by setting load_custom_cuda_lib=False at FSW_embedding() init.' % (libfsw_embedding_path))
 
@@ -657,7 +660,6 @@ class FSW_embedding(nn.Module):
             if fsw_embedding_basic_safety_checks:
                 assert not torch.isnan(X_edge_vals).any(), "X_edge_vals cannot contain NaNs"
                 assert not torch.isinf(X_edge_vals).any(), "All entries of X_edge_vals must be finite"
-                assert (X_edge_vals >= 0).all(), "All entries of X_edge_vals must be nonnegative"
                 del X_edge_vals
 
             assert X_edge.is_sparse == W.is_sparse, 'X_edge and W must either both or neither be sparse'
@@ -706,7 +708,7 @@ class FSW_embedding(nn.Module):
                     "Shape mismatch between X_edge and W: if W.shape = (b1,b2,...,bk,nRecipients,n) then X.shape should be (b1,b2,...,bk,nRecipients,n,d_edge) (with the possible exception (b1,b2,...,bk,nRecipients,n) when d_edge=1" )
                 
                 if X_edge.is_sparse:
-                    assert X_edge.values().numel() == W.values().numel(), 'Sparse X_edge must have the same number of values() as W'
+                    assert X_edge.values().shape[0] == W.values().shape[0], 'Sparse X_edge must have the same number of values() as W'
                     if fsw_embedding_basic_safety_checks:
                         assert (X_edge.indices() == W.indices()).all(), 'Sparse X_edge must have the same nonzero pattern as W'
                     
@@ -753,10 +755,31 @@ class FSW_embedding(nn.Module):
             X = torch.cat( (X, torch.zeros(zshape, device=X.device, dtype=X.dtype)), dim=-2 )               
 
             if W.is_sparse:
-                W = ag.concat_sparse.apply(W, W_pad.to_sparse())
+                W_pad = W_pad.to_sparse()
+                W = ag.concat_sparse.apply(W, W_pad)
                 slice_info_W = sp.get_slice_info(W, -1)
+                if X_edge is not None:
+                    # TODO: Ensure this is efficient
+                    # TODO: Revise sp.sparse_coo_tensor_coalesced, ravel_index and verify_coalesecnce() for their suitability to dense_dim > 0
+                    # TODO: Revise concat_sparse for its suitability to dense_dim > 0, especially its backward() call.
+
+                    X_edge_pad_inds = W_pad.indices()
+                    X_edge_pad_vals = torch.zeros( (nRecipients, self.d_edge), device=X.device, dtype=X.dtype)
+                    X_edge_pad_shape = replace_in_tuple(tuple(X_edge.shape), -2, 1)
+                   
+                    X_edge_pad = torch.sparse_coo_tensor(indices=X_edge_pad_inds, 
+                                                                values=X_edge_pad_vals,
+                                                                size = X_edge_pad_shape).coalesce() # TODO: Make sp.sparse_coo_tensor_coalesced work here
+
+                    X_edge = ag.concat_sparse.apply(X_edge, X_edge_pad)
             else:
                 W = torch.cat( (W, W_pad), dim=-1 )
+                if X_edge is not None:
+                    zshape = list(W.shape)+[self.d_edge,]
+                    zshape[-2] = 1
+                    if X_edge.dim() == W.dim():
+                        X_edge = X_edge.unsqueeze(-1)
+                    X_edge = torch.cat( (X_edge, torch.zeros(zshape, device=X.device, dtype=X.dtype)), dim=-2 )
 
             W_sum_padded = ag.custom_lowclamp.apply(W_sum, self.total_mass_pad_thresh)
         else:            
@@ -824,16 +847,20 @@ class FSW_embedding(nn.Module):
 
         d_in = X.shape[-1]
         n = W.shape[-1]
+        nRecepients = W.shape[-2] if graph_mode else None
         nProjs = projVecs.shape[0]
         nFreqs = len(freqs)
         sparse_mode = W.is_sparse
-        d_edge = X_edge.shape[-1] if X_edge is not None else None
+        d_edge = X_edge.shape[-1] if X_edge is not None else 0
 
         assert len(freqs.shape) == 1, "This should not happen"
-        assert (len(projVecs.shape) == 2) and (projVecs.shape[1] == d_in), "This should not happen"
+        assert (len(projVecs.shape) == 2) and (projVecs.shape[1] == d_in + d_edge), "This should not happen"
 
         # Calculate the projections of X 
-        Xp = torch.tensordot(X, projVecs, dims=((-1,),(1,)))
+        if d_edge == 0:
+            Xp = torch.tensordot(X, projVecs, dims=((-1,),(1,)))
+        else:
+            Xp = torch.tensordot(X, projVecs[:,0:d_in], dims=((-1,),(1,)))
 
         del X
 
@@ -841,16 +868,57 @@ class FSW_embedding(nn.Module):
 
         # Sort the projected elements 
         # Note: We sort before the graph-mode expansion because it makes things simpler in the case when W is sparse
-        if sparse_mode:
-            Xps, Xpi = ag.sort.apply(Xp, -2, False)
-        else:
-            Xps, Xpi = torch.sort(Xp, dim=-2, descending=False)
+        if d_edge == 0:
+            # Sort along element/sender axis
+            if sparse_mode:
+                Xps, Xpi = ag.sort.apply(Xp, -2, False)
+            else:
+                Xps, Xpi = torch.sort(Xp, dim=-2, descending=False)
 
-        del Xp
+            del Xp
 
-        if graph_mode:
-            Xps = Xps.unsqueeze(dim=-3)
-            Xpi = Xpi.unsqueeze(dim=-3)
+            if graph_mode:
+                # Create recepient axis before sender axis and projection axis
+                Xps = Xps.unsqueeze(dim=-3)
+                Xpi = Xpi.unsqueeze(dim=-3)
+
+        elif sparse_mode: # d_edge > 0, sparse_mode=True
+            # TODO: Remove this command since we assume X_edge is already in values() format
+            Xe = X_edge.values()
+
+            Xep = torch.tensordot(Xe, projVecs[:,d_in:], dims=((-1,),(-1,)))                 
+
+            inds = W.indices()
+
+            # Remove recepient axis from inds
+            II = [i for i in range(inds.shape[0]) if i != len(batch_dims)]
+            Xp_temp = Xp[tuple(inds[II,:])]
+
+            Xep += Xp_temp
+
+            Xep_shape = replace_in_tuple(tuple(X_edge.shape), -1, Xep.shape[1])
+
+            Xep = torch.sparse_coo_tensor(indices=W.indices(), values=Xep, size=Xep_shape).coalesce() #TODO: Check coalesce
+            Xep = ag.flatten_dense_dim.apply(Xep)
+            Xeps, Xepi = ag.sort_sparse.apply(Xep, -2, False)
+
+            assert Xep.dense_dim() == 0
+            Xeps_err = torch.norm(Xeps.to_dense() - torch.sort(Xep.to_dense(), dim=-2)[0]).item()
+
+        else: # d_edge > 0, sparse_mode=False
+            # Create recepient axis before sender axis and projection axis
+            Xpx = Xp.unsqueeze(dim=-3) #.expand(tuple(W.shape) + (nProjs,))
+            # Replicate Xpx along recepient axis
+            Xpx = Xpx.repeat(replace_in_tuple((1,)*Xpx.dim(),-3,nRecepients))
+            # Add edge-feature part of inner product to each recepient for each sender and projection
+            Xpx += torch.tensordot(X_edge, projVecs[:,d_in:], dims=((-1,),(-1,)))
+            # Sort along element/sender axis
+            Xps, Xpi = torch.sort(Xpx, dim=-2, descending=False, stable=True) #TODO: Make sure gradient works here
+            #Xps, Xpi = ag.sort.apply(Xpx, -2, False)
+
+            #print('Xpx dense: ', Xpx)
+            print('Xps dense: ', Xps.shape, Xps)
+            del Xpx
 
         # Axis numbers as in the implementation of forward()
         # Note: These numbers are true only from here
@@ -866,7 +934,7 @@ class FSW_embedding(nn.Module):
             freqs = freqs.unsqueeze(0)
 
         if not sparse_mode:
-            if graph_mode:
+            if graph_mode and (d_edge == 0):
                 Xps = Xps.expand(tuple(W.shape) + (nProjs,))
                 Xpi = Xpi.expand(tuple(W.shape) + (nProjs,))
 
@@ -898,14 +966,18 @@ class FSW_embedding(nn.Module):
             W_big = ag.repmat_sparse.apply(W_unsqueeze, nProjs, proj_axis)
             del W_unsqueeze
 
-            if graph_mode: 
+            if d_edge > 0:
+                # TODO: Make sure this works well
+                Wps = ag.permute_sparse_vals.apply(W_big, Xepi)
+            elif graph_mode: 
                 # 1.82 seconds
                 Wps = ag.permute_sparse.apply(W_big, element_axis, Xpi, recipient_axis)
             else:
                 Wps = ag.permute_sparse.apply(W_big, element_axis, Xpi, None)
 
             # Once we have Wps we don't need W_big and Xpi
-            del W_big, Xpi
+            del W_big
+            # TODO: Delete Xpi, Xepi
 
             # 2.6 seconds
             slice_info_elements = sp.get_slice_info(Wps, element_axis)
@@ -962,12 +1034,16 @@ class FSW_embedding(nn.Module):
         # From here we only need sinc_diffs and Xps               
 
         if sparse_mode:
-            if True:
+            if d_edge == 0:
                 # 1.4 seconds
                 slice_info_Xps = sp.get_slice_info(sinc_diffs, sp.get_broadcast_dims_B_to_A(sinc_diffs, Xps))
                 # 0.26 seconds
                 products = ag.mul_sparse_dense.apply(sinc_diffs, Xps, slice_info_Xps)
                 sp.verify_coalescence(products)
+            else:
+                # TODO: Handle this
+                products = ag.mul_same_pattern.apply(sinc_diffs, Xeps, 1)
+                pass                
 
             # 0.49 seconds
             product_sums = ag.sum_sparseToDense.apply(products, element_axis, slice_info_elements)
@@ -1054,6 +1130,7 @@ def diff_zeropad(input, dim):
 
 
 def replace_in_tuple(T, index, value):
+    index = index if index >= 0 else ( index + len(T) )
     out = T[0:index] + (value,) + T[(index+1):len(T)]
     return out
 
@@ -1204,6 +1281,49 @@ class ag:
             sp.verify_coalescence(out)
 
             return out, None, None, None
+
+
+
+    # Permutes the values of a sparse tensor according to the input permutation
+    class permute_sparse_vals(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, sparse_tensor, perm):           
+            # Extract the indices and values
+            indices = sparse_tensor.indices()
+            values = sparse_tensor.values()
+            
+            # Permute the values according to the input permutation
+            permuted_values = values[perm]
+            del values
+            
+            # Create a new sparse tensor with permuted values
+            # TODO: Check if we need to coalesce
+            output_sparse_tensor = torch.sparse_coo_tensor(indices, permuted_values, sparse_tensor.size()).coalesce()
+            del indices, permuted_values
+
+            # Save the permutation for backward
+            ctx.perm = perm if ctx.needs_input_grad[0] else None
+
+            return output_sparse_tensor
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            # Retrieve the permutation
+            perm = ctx.perm
+            
+            # TODO: Check if necessary
+            grad_output = grad_output.coalesce()
+
+            # The gradient w.r.t. the input values is the permuted gradient output
+            grad_input_values = torch.empty_like(grad_output.values())
+            grad_input_values[perm] = grad_output.values()
+            
+            # Create a gradient sparse tensor
+            # TODO: Transit to sparse_coo_tensor_coalesced
+            grad_input = torch.sparse_coo_tensor(grad_output.indices(), grad_input_values, grad_output.size(), device=grad_output.device).coalesce()
+            
+            # No gradient for the permutation itself (None)
+            return grad_input, None
 
 
 
@@ -1663,7 +1783,11 @@ class ag:
             # Ensure both A and B are sparse and coalesced
             assert A.is_sparse and A.is_coalesced(), "A must be a coalesced sparse tensor"
             assert B.is_sparse and B.is_coalesced(), "B must be a coalesced sparse tensor"
-            assert (A.dim() == B.dim()) and (A.shape[:-1] == B.shape[:-1]), "A and B must have the same shape except for the last dimension"
+            assert (A.dim() == B.dim()) and (A.sparse_dim() == B.sparse_dim()), "A and B must have the same shape, except for their last sparse dimension, which should be identical"
+            sA = list(A.shape); sB = list(B.shape)
+            sA[A.sparse_dim()-1] = 1
+            sB[B.sparse_dim()-1] = 1
+            assert (sA == sB), "A and B must have the same shape, except for their last sparse dimension, which should be identical"
 
             sp.verify_coalescence(A)
             sp.verify_coalescence(B)
@@ -1673,7 +1797,10 @@ class ag:
             B_indices, B_values = B.indices(), B.values()
 
             # Calculate the offset for indices of B
-            offset = A.shape[-1]
+            sdims = A.sparse_dim()
+            sparse_dims = tuple(A.shape[0:sdims])
+
+            offset = sparse_dims[-1]
             new_B_indices = B_indices.clone()
             new_B_indices[-1, :] += offset
 
@@ -1683,7 +1810,7 @@ class ag:
 
             # Get the size of the resulting sparse tensor
             combined_size = list(A.shape)
-            combined_size[-1] += B.shape[-1]
+            combined_size[sdims-1] += B.shape[sdims-1]
 
             # Create the output sparse tensor and coalesce it
             combined_indices, combined_values = sp.sort_inds_vals(combined_indices, combined_values, combined_size) 
@@ -1733,8 +1860,78 @@ class ag:
             sp.verify_coalescence(grad_B)
             return grad_A, grad_B
 
+
+    # Takes a sparse tensor whose dense dimension is 1 and returns a sparse tensor with the same shape, whose dense dimension is zero.
+    class flatten_dense_dim(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, sparse_tensor):
+            # Ensure the input is a sparse tensor with dense_dim = 1
+            assert sparse_tensor.is_sparse
+            assert sparse_tensor.dense_dim() == 1
             
+            # Save context for backward pass
+            ctx.shape = sparse_tensor.shape
+            
+            # Extract indices and values
+            indices = sparse_tensor.indices()  # Shape: (sparse_dim, nnz)
+            values = sparse_tensor.values()    # Shape: (nnz, dense_dim)
+            
+            # Flatten the dense dimension into the sparse indices
+            nnz = values.size(0)
+            dense_dim = values.size(1)
+            
+            # Repeat indices for each dense element
+            expanded_indices = indices.repeat_interleave(dense_dim, dim=1)
+            
+            # Create new indices for the dense dimension
+            additional_indices = torch.arange(dense_dim, device=indices.device).repeat(nnz)
+            additional_indices = additional_indices.view(1, -1)
+            
+            # Combine sparse and new dense indices
+            combined_indices = torch.cat([expanded_indices, additional_indices], dim=0)
+            
+            # Flatten values
+            expanded_values = values.view(-1)
+            
+            # TODO: Try changing this to sparse_coo_tensor_coalesced
+            # Create the output sparse tensor            
+            output_sparse_tensor = torch.sparse_coo_tensor(
+                combined_indices, 
+                expanded_values, 
+                sparse_tensor.size()[:-1] + (dense_dim,), 
+                device=sparse_tensor.device
+            ).coalesce()
+            
+            return output_sparse_tensor
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            if grad_output.is_sparse:
+                # TODO: Check if this coalesce() is necessary
+                grad_output = grad_output.coalesce()
+
+                indices = grad_output.indices()
+                values = grad_output.values()
+
+                # Reverse the transformation: re-construct the gradient for the original dense dimension
+                dense_dim = ctx.shape[-1]
+
+                arange_indices = torch.arange(0, indices.shape[1], dense_dim, device=indices.device)
+                reduced_indices = indices[:-1, arange_indices]
+                del indices, arange_indices
+
+                grad_values = values.view(-1, dense_dim)
+                del values
+
+                grad_input = torch.sparse_coo_tensor(reduced_indices, grad_values, ctx.shape, device=grad_output.device)
+            else:
+                raise RuntimeError("Expected sparse gradient output")
+            
+            return grad_input
+
+
     # Equivalent to torch.sort(X, dim=dim, descending=descending)
+    # Works only on dense tensors
     class sort(torch.autograd.Function):
         @staticmethod
         def forward(ctx, X, dim, descending):
@@ -1776,6 +1973,72 @@ class ag:
 
             return grad_input, None, None
 
+
+    # TODO: Make sure is efficient
+    # Sorts a sparse tensor along a given dimension
+    class sort_sparse(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, A, dim, descending):
+            dim = dim if dim >= 0 else ( dim + A.dim() )
+
+            # Extract indices and values
+            inds = A.indices()
+            vals = A.values()
+            
+            sortdims = [d for d in range(A.dim()) if d != dim]
+
+            inds2 = inds[sortdims,:]
+            shape2 = [A.shape[d] for d in sortdims]
+
+            inds1d = sp.ravel_index(inds2, shape2)
+            del inds2, shape2
+
+            perm_vals = torch.argsort(vals, descending=descending, stable=True)
+            perm_inds = torch.argsort(inds1d[perm_vals], descending=False, stable=True)            
+
+            if dim==A.dim()-1:
+                del inds1d
+                perm = perm_vals[perm_inds]
+                del perm_vals, perm_inds
+            else:                
+                perm_inds2 = torch.argsort(inds1d, descending=False, stable=True)
+                del inds1d
+                perm = torch.empty_like(perm_vals)
+                perm_dest = perm_vals[perm_inds]
+                del perm_vals, perm_inds                
+                perm[perm_inds2] = perm_dest
+                del perm_inds2
+                      
+            # Reconstruct sorted sparse tensor
+            out = sp.sparse_coo_tensor_coalesced(inds, vals[perm], A.shape)
+            #out = torch.sparse_coo_tensor(inds, vals[perm], A.shape).coalesce()
+            
+            # Save the original indices and sorted indices for backward
+            if ctx.needs_input_grad[0]:
+                ctx.perm = perm
+            
+            return out, perm
+
+        @staticmethod
+        def backward(ctx, grad_output, aaa):
+
+            if ctx.needs_input_grad[0]:
+                # TODO: See if we can get rid of this coalesce()
+                grad_output = grad_output.coalesce()
+
+                inds = grad_output.indices()
+                vals = grad_output.values()
+
+                vals_out = torch.empty(vals.shape[0], device=grad_output.device, dtype=grad_output.dtype)
+                vals_out[ctx.perm] = vals
+                del vals
+                grad_input = torch.sparse_coo_tensor(inds, vals_out, grad_output.shape)
+                del inds
+            else:
+                grad_input = None
+                      
+            return grad_input, None, None
+    
 
 
     # Equivalent to torch.cumsum(X, dim=dim)
@@ -1908,8 +2171,9 @@ class sp:
     # Create a COO sparse tensor in a coalesced state, assuming that the input indices are already coalesced.
     # If the command sp.verify_coalescence(out) is not commented, the tensor is verified for being correctly coalesced.
     def sparse_coo_tensor_coalesced(indices, values, size:list[int]):
+        sparse_dims = indices.shape[0]
         if fsw_embedding_debug_mode:
-            inds1d = sp.ravel_index(indices, shape=size)
+            inds1d = sp.ravel_index(indices, shape=size[0:sparse_dims])
             assert torch.unique(inds1d).numel() == inds1d.numel(), 'indices are not unique'
             assert (torch.sort(inds1d)[0] == inds1d).all(), 'indices are unique but not sorted'
 
@@ -1996,11 +2260,16 @@ class sp:
     # Sort indices and values. Similar to coalesce(), but does not assume nor impose uniqueness.
     # 2.93 seconds
     def sort_inds_vals(indices, values, shape=None):
+        dense_dims = values.dim()-1
+        sparse_dims = indices.shape[0]
+
         if shape is None:
             shape, _ = torch.max(indices, dim=1)
             shape += 1
-
-        shape = tuple(shape)
+            shape = tuple(shape)
+        else:
+            shape = tuple(shape)
+            shape = shape[0:sparse_dims]        
 
         # 0.54 seconds
         inds1d = sp.ravel_index(indices, shape)
@@ -2015,7 +2284,10 @@ class sp:
         del inds1d
 
         # 0.6 seconds
-        out = (indices[:,sort_perm], values[sort_perm])
+        if sort_perm.dim() == 1:
+            out = (indices[:,sort_perm], values[sort_perm])
+        else:
+            out = (indices[:,sort_perm], values[sort_perm,:])
 
         if fsw_embedding_debug_mode:
             assert (out[0] != indices).any(), 'input was already sorted. the code can be sped up by avoiding sort in this particular case'
@@ -2047,7 +2319,8 @@ class sp:
         assert A.is_sparse, "input tensor must be sparse"
         assert_coalesced(A)
 
-        assert slice_info is not None, 'if this happens, there might be an inefficiency in the code'
+        if fsw_embedding_debug_mode:
+            assert slice_info is not None, 'if this happens, there might be an inefficiency in the code'
 
         # Shape of the sparse tensor
         shape = list(A.shape)
