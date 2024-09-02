@@ -4,7 +4,7 @@
 # Technion Institute of Technology
 # Haifa, Israel
 
-version = '2.09a'
+version = '2.1'
 version_date = '2024-00-02'
 
 # Edge features:
@@ -22,6 +22,9 @@ version_date = '2024-00-02'
 # 1. If d_in+d_edge=1, all proj vecs should equal 1.
 # 2. Add support for zero-sized output along any possible dimension (flat input corresponding to empty multisets, d_out=0)
 # 3. Accelerate by explicitly computing W, W_sum and W_cumsum when W='uniform' or 'unit'
+# 3. Rename 'cartesian_mode' to 'cartesian_freqs'
+# 3. Add support for edge features and cartesian mode together, or at least add warning that it doesn't work
+# 4. Replace torch's sparse tensors by custom handling of indices, values
 # 5. For safety, in all functions under the class sp that return sparse tensors, make sure gradient of input is off
 # 6. Make sure that the state_dict saves all the embedding parameters, not just the pytorch tensors (e.g. encode_total_mass).
 # 7. Implement custom .state_dict() and .load_state_dict() methods, which should save and load accompanyting non-tensor parameters,
@@ -29,6 +32,7 @@ version_date = '2024-00-02'
 #    directly from a saved state_dict.
 
 # Changelog:
+# 2.1     added full edge-feature support
 # 2.09a   edge feature support is working (beta)
 # 2.03a   can handle failed loading of custom CUDA library
 # 2.02a   more efficient gradient handling in permute_sparse; renamed dimension variable names d, m to d_in, d_out
@@ -195,7 +199,7 @@ class FSW_embedding(nn.Module):
         # Process sizes
         assert d_in >= 0, 'd_in must be nonnegative'
         assert d_edge >= 0, 'd_edge must be nonnegative'
-        assert d_out >= 0, 'd_out must be nonnegative'
+        assert (d_out is None) or (d_out >= 0), 'd_out must be nonnegative or None'
 
         if d_out == 0:
             # If the output should be empty, we force encode_total_mass to be False
@@ -649,7 +653,7 @@ class FSW_embedding(nn.Module):
 
                 assert X_edge.is_coalesced(), 'Sparse X_edge must be coalesced'
                 assert X_edge.dense_dim() in (0,1), 'X_edge.dense_dim() must be 1 or 0'
-                assert (self.d_edge > 1) or (X_edge.dense_dim() == 1), 'X_edge.dense_dim() must be 1 since d_edge > 1'
+                assert (self.d_edge == 1) or (X_edge.dense_dim() == 1), 'X_edge.dense_dim() must be 1 since d_edge > 1'
 
                 if fsw_embedding_basic_safety_checks:
                     X_edge_vals = X_edge.values()
@@ -711,10 +715,11 @@ class FSW_embedding(nn.Module):
                     assert X_edge.values().shape[0] == W.values().shape[0], 'Sparse X_edge must have the same number of values() as W'
                     if fsw_embedding_basic_safety_checks:
                         assert (X_edge.indices() == W.indices()).all(), 'Sparse X_edge must have the same nonzero pattern as W'
-                    
-                # TODO: In both sparse and dense cases, if X_edge is squeezed to the same shape as W, unsqueeze it to (W.shape, d_edge)/
-                #       If sparse, the unsqueeze should take place along a dense dimension. Write an autograd function for that.
 
+                    if X_edge.dense_dim()==0:
+                        X_edge = ag.unsqueeze_dense_dim.apply(X_edge)
+                    
+ 
 
 
 
@@ -758,19 +763,13 @@ class FSW_embedding(nn.Module):
                 W_pad = W_pad.to_sparse()
                 W = ag.concat_sparse.apply(W, W_pad)
                 slice_info_W = sp.get_slice_info(W, -1)
-                if X_edge is not None:
-                    # TODO: Ensure this is efficient
-                    # TODO: Revise sp.sparse_coo_tensor_coalesced, ravel_index and verify_coalesecnce() for their suitability to dense_dim > 0
-                    # TODO: Revise concat_sparse for its suitability to dense_dim > 0, especially its backward() call.
 
+                if X_edge is not None:
                     X_edge_pad_inds = W_pad.indices()
                     X_edge_pad_vals = torch.zeros( (nRecipients, self.d_edge), device=X.device, dtype=X.dtype)
                     X_edge_pad_shape = replace_in_tuple(tuple(X_edge.shape), -2, 1)
                    
-                    X_edge_pad = torch.sparse_coo_tensor(indices=X_edge_pad_inds, 
-                                                                values=X_edge_pad_vals,
-                                                                size = X_edge_pad_shape).coalesce() # TODO: Make sp.sparse_coo_tensor_coalesced work here
-
+                    X_edge_pad = sp.sparse_coo_tensor_coalesced(indices=X_edge_pad_inds, values=X_edge_pad_vals, size = X_edge_pad_shape)
                     X_edge = ag.concat_sparse.apply(X_edge, X_edge_pad)
             else:
                 W = torch.cat( (W, W_pad), dim=-1 )
@@ -864,11 +863,10 @@ class FSW_embedding(nn.Module):
 
         del X
 
-        # TODO: Add X_edge code here
-
-        # Sort the projected elements 
-        # Note: We sort before the graph-mode expansion because it makes things simpler in the case when W is sparse
         if d_edge == 0:
+            # Sort the projected elements 
+            # Note: We sort before the graph-mode expansion because it makes things simpler in the case when W is sparse
+
             # Sort along element/sender axis
             if sparse_mode:
                 Xps, Xpi = ag.sort.apply(Xp, -2, False)
@@ -883,27 +881,27 @@ class FSW_embedding(nn.Module):
                 Xpi = Xpi.unsqueeze(dim=-3)
 
         elif sparse_mode: # d_edge > 0, sparse_mode=True
-            # TODO: Remove this command since we assume X_edge is already in values() format
             Xe = X_edge.values()
-
-            Xep = torch.tensordot(Xe, projVecs[:,d_in:], dims=((-1,),(-1,)))                 
+            Xep = torch.tensordot(Xe, projVecs[:,d_in:], dims=((-1,),(-1,)))
+            del Xe
 
             inds = W.indices()
 
             # Remove recepient axis from inds
-            II = [i for i in range(inds.shape[0]) if i != len(batch_dims)]
-            Xp_temp = Xp[tuple(inds[II,:])]
+            dims_without_recipient = [i for i in range(inds.shape[0]) if i != len(batch_dims)]
+
+            # For each edge, get the corresponding sender vertex feature vector after projection
+            Xp_temp = Xp[tuple(inds[dims_without_recipient,:])]
 
             Xep += Xp_temp
+            del Xp_temp, inds
 
             Xep_shape = replace_in_tuple(tuple(X_edge.shape), -1, Xep.shape[1])
 
-            Xep = torch.sparse_coo_tensor(indices=W.indices(), values=Xep, size=Xep_shape).coalesce() #TODO: Check coalesce
+            Xep = sp.sparse_coo_tensor_coalesced(indices=W.indices(), values=Xep, size=Xep_shape)
             Xep = ag.flatten_dense_dim.apply(Xep)
             Xeps, Xepi = ag.sort_sparse.apply(Xep, -2, False)
-
-            assert Xep.dense_dim() == 0
-            Xeps_err = torch.norm(Xeps.to_dense() - torch.sort(Xep.to_dense(), dim=-2)[0]).item()
+            del Xep
 
         else: # d_edge > 0, sparse_mode=False
             # Create recepient axis before sender axis and projection axis
@@ -913,11 +911,9 @@ class FSW_embedding(nn.Module):
             # Add edge-feature part of inner product to each recepient for each sender and projection
             Xpx += torch.tensordot(X_edge, projVecs[:,d_in:], dims=((-1,),(-1,)))
             # Sort along element/sender axis
-            Xps, Xpi = torch.sort(Xpx, dim=-2, descending=False, stable=True) #TODO: Make sure gradient works here
-            #Xps, Xpi = ag.sort.apply(Xpx, -2, False)
+            Xps, Xpi = ag.sort.apply(Xpx, -2, False)
+            #Xps, Xpi = torch.sort(Xpx, dim=-2, descending=False, stable=True)
 
-            #print('Xpx dense: ', Xpx)
-            print('Xps dense: ', Xps.shape, Xps)
             del Xpx
 
         # Axis numbers as in the implementation of forward()
@@ -940,7 +936,7 @@ class FSW_embedding(nn.Module):
 
             # Sort the weights according to their corresponding projected elements
             W_big = W.unsqueeze(-1).expand_as(Xps)
-            Wps = torch.gather(W_big, dim=element_axis, index=Xpi)
+            Wps = torch.gather(W_big, dim=element_axis, index=Xpi.to(torch.int64))
 
             if cartesian_mode:
                 Wps = Wps.unsqueeze(dim=-1)
@@ -967,17 +963,18 @@ class FSW_embedding(nn.Module):
             del W_unsqueeze
 
             if d_edge > 0:
-                # TODO: Make sure this works well
                 Wps = ag.permute_sparse_vals.apply(W_big, Xepi)
+                del Xepi
             elif graph_mode: 
                 # 1.82 seconds
                 Wps = ag.permute_sparse.apply(W_big, element_axis, Xpi, recipient_axis)
+                del Xpi
             else:
                 Wps = ag.permute_sparse.apply(W_big, element_axis, Xpi, None)
+                del Xpi
 
             # Once we have Wps we don't need W_big and Xpi
             del W_big
-            # TODO: Delete Xpi, Xepi
 
             # 2.6 seconds
             slice_info_elements = sp.get_slice_info(Wps, element_axis)
@@ -1039,25 +1036,26 @@ class FSW_embedding(nn.Module):
                 slice_info_Xps = sp.get_slice_info(sinc_diffs, sp.get_broadcast_dims_B_to_A(sinc_diffs, Xps))
                 # 0.26 seconds
                 products = ag.mul_sparse_dense.apply(sinc_diffs, Xps, slice_info_Xps)
+                del sinc_diffs, Xps, slice_info_Xps
                 sp.verify_coalescence(products)
             else:
-                # TODO: Handle this
                 products = ag.mul_same_pattern.apply(sinc_diffs, Xeps, 1)
-                pass                
+                del sinc_diffs, Xeps
 
             # 0.49 seconds
             product_sums = ag.sum_sparseToDense.apply(products, element_axis, slice_info_elements)
+            del products, slice_info_elements
             
         else: # not sparse
             product_sums = torch.sum(sinc_diffs * Xps, dim=element_axis, keepdim=True)
+            del sinc_diffs, Xps
 
         # We squeeze the element axis after having summed up along it
         product_sums = product_sums.squeeze(dim=element_axis)
         freqs = freqs.squeeze(dim=element_axis)
 
         # freqs and product_sums are always dense
-        out = (1+freqs) * product_sums
-            
+        out = (1+freqs) * product_sums            
         del product_sums
 
         return out
@@ -1130,6 +1128,7 @@ def diff_zeropad(input, dim):
 
 
 def replace_in_tuple(T, index, value):
+    T = tuple(T)
     index = index if index >= 0 else ( index + len(T) )
     out = T[0:index] + (value,) + T[(index+1):len(T)]
     return out
@@ -1184,7 +1183,8 @@ class ag:
     class coalesce_grad(torch.autograd.Function):
         @staticmethod        
         def forward(ctx, A):            
-            return A.clone()
+            # TODO: Do we need to return A.clone() rather than A?
+            return A
 
         @staticmethod
         @once_differentiable
@@ -1261,20 +1261,11 @@ class ag:
 
             if grad_output.is_coalesced():
                 pass
-            elif nvals_grad_output == 2*nvals_A:
-                # In this case we have two consecutive copies of the same list of indices, so we just sum the corresponding values.
-                # The resulting tensor is coalesced, since each part was already coalesced by the functions that returned the two halves of grad_output.
-                if fsw_embedding_debug_mode:
-                    assert (grad_output._indices()[:, 0:nvals_A] == grad_output._indices()[:, nvals_A:]).all()
-
-                inds_temp = grad_output._indices()[:, 0:nvals_A]
-                vals_temp = grad_output._values()[0:nvals_A] + grad_output._values()[nvals_A:]
-
-                grad_output = sp.sparse_coo_tensor_coalesced(indices=inds_temp, values=vals_temp, size=grad_output.shape)
-                del inds_temp, vals_temp
+            elif nvals_grad_output % nvals_A == 0:
+                grad_output = sp.coalesce_repeated(grad_output, nvals_A)
             else:
                 if fsw_embedding_debug_mode:
-                    raise RuntimeError('Strange case. Check if grad_output contains more than two copies of coalesced indices. If so, implement efficient treatment as in the case above.')
+                    raise RuntimeError('Strange. Check why this happens')
                 grad_output = grad_output.coalesce()
                 
             out = sp.permute(grad_output, dim=dim, perms=perms, broadcast_perms_dim=broadcast_perms_dim, backward_mode=True)
@@ -1287,7 +1278,9 @@ class ag:
     # Permutes the values of a sparse tensor according to the input permutation
     class permute_sparse_vals(torch.autograd.Function):
         @staticmethod
-        def forward(ctx, sparse_tensor, perm):           
+        def forward(ctx, sparse_tensor, perm):
+            sp.verify_coalescence(sparse_tensor, dense_dim=None)
+
             # Extract the indices and values
             indices = sparse_tensor.indices()
             values = sparse_tensor.values()
@@ -1297,11 +1290,11 @@ class ag:
             del values
             
             # Create a new sparse tensor with permuted values
-            # TODO: Check if we need to coalesce
-            output_sparse_tensor = torch.sparse_coo_tensor(indices, permuted_values, sparse_tensor.size()).coalesce()
+            output_sparse_tensor = sp.sparse_coo_tensor_coalesced(indices, permuted_values, sparse_tensor.size())
             del indices, permuted_values
 
             # Save the permutation for backward
+            ctx.nvals = sparse_tensor.indices().shape[1]
             ctx.perm = perm if ctx.needs_input_grad[0] else None
 
             return output_sparse_tensor
@@ -1309,18 +1302,16 @@ class ag:
         @staticmethod
         def backward(ctx, grad_output):
             # Retrieve the permutation
-            perm = ctx.perm
-            
-            # TODO: Check if necessary
-            grad_output = grad_output.coalesce()
+            perm = ctx.perm            
+
+            grad_output = sp.coalesce_repeated(grad_output, window_size=ctx.nvals)
 
             # The gradient w.r.t. the input values is the permuted gradient output
             grad_input_values = torch.empty_like(grad_output.values())
             grad_input_values[perm] = grad_output.values()
             
             # Create a gradient sparse tensor
-            # TODO: Transit to sparse_coo_tensor_coalesced
-            grad_input = torch.sparse_coo_tensor(grad_output.indices(), grad_input_values, grad_output.size(), device=grad_output.device).coalesce()
+            grad_input = sp.sparse_coo_tensor_coalesced(grad_output.indices(), grad_input_values, grad_output.shape)
             
             # No gradient for the permutation itself (None)
             return grad_input, None
@@ -1775,157 +1766,211 @@ class ag:
             return grad_A, grad_B
 
 
-    # Concatenates two sparse tensors along their last dimension, similarly to
-    # torch.cat((A,B), dim=-1)
+    # Concatenates two sparse tensors along their last sparse dimension, similarly to torch.cat((A,B), dim=A.sparse_dim()-1)
+    # Supports tensors with dense_dim > 0. The two tensors should have the same dense_dim() and have the same shape along all dimensions
+    # except for sparse_dim()-1
     class concat_sparse(torch.autograd.Function):
         @staticmethod
         def forward(ctx, A, B):
             # Ensure both A and B are sparse and coalesced
-            assert A.is_sparse and A.is_coalesced(), "A must be a coalesced sparse tensor"
-            assert B.is_sparse and B.is_coalesced(), "B must be a coalesced sparse tensor"
+            sp.verify_coalescence(A, dense_dim=None)
+            sp.verify_coalescence(B, dense_dim=None)
             assert (A.dim() == B.dim()) and (A.sparse_dim() == B.sparse_dim()), "A and B must have the same shape, except for their last sparse dimension, which should be identical"
-            sA = list(A.shape); sB = list(B.shape)
-            sA[A.sparse_dim()-1] = 1
-            sB[B.sparse_dim()-1] = 1
+            sA = replace_in_tuple(A.shape, A.sparse_dim()-1, 1)
+            sB = replace_in_tuple(B.shape, B.sparse_dim()-1, 1)
             assert (sA == sB), "A and B must have the same shape, except for their last sparse dimension, which should be identical"
 
-            sp.verify_coalescence(A)
-            sp.verify_coalescence(B)
+            sparse_dim = A.sparse_dim()
+            dense_dim = A.dense_dim()
+            A_nvals = A.indices().shape[1]
+            B_nvals = B.indices().shape[1]
 
-            # Get the indices and values of A and B
-            A_indices, A_values = A.indices(), A.values()
-            B_indices, B_values = B.indices(), B.values()
+            # This is identical for A and B
+            dense_shape = A.shape[sparse_dim:]
 
             # Calculate the offset for indices of B
-            sdims = A.sparse_dim()
-            sparse_dims = tuple(A.shape[0:sdims])
-
-            offset = sparse_dims[-1]
-            new_B_indices = B_indices.clone()
-            new_B_indices[-1, :] += offset
+            offset = A.shape[sparse_dim-1]
 
             # Concatenate indices and values
-            combined_indices = torch.cat([A_indices, new_B_indices], dim=1)
-            combined_values = torch.cat([A_values, B_values], dim=0)
+            if True:
+                # More efficient variant
+                combined_indices = torch.empty((sparse_dim, A_nvals+B_nvals), device=A.device, dtype=A.indices().dtype)
+                combined_indices[:, 0:A_nvals] = A.indices()
+                combined_indices[:, A_nvals:] = B.indices()
+                combined_indices[-1, A_nvals:] += offset
+
+                combined_values = torch.empty( (A_nvals+B_nvals,) + dense_shape, device=A.device, dtype=A.dtype)
+                combined_values[0:A_nvals, ...] = A.values()
+                combined_values[A_nvals:, ...] = B.values()
+            else:
+                # Clearer variant
+                new_B_indices = B_indices.clone()
+                new_B_indices[-1, :] += offset
+                combined_indices = torch.cat([A.indices(), new_B_indices], dim=1)
+                combined_values = torch.cat([A.values(), B.values()], dim=0)
 
             # Get the size of the resulting sparse tensor
             combined_size = list(A.shape)
-            combined_size[sdims-1] += B.shape[sdims-1]
+            combined_size[sparse_dim-1] += B.shape[sparse_dim-1]
 
             # Create the output sparse tensor and coalesce it
             combined_indices, combined_values = sp.sort_inds_vals(combined_indices, combined_values, combined_size) 
             C = sp.sparse_coo_tensor_coalesced(combined_indices, combined_values, combined_size)
 
             # Save information for backward pass
+            ctx.sparse_dim = sparse_dim
+            ctx.dense_dim = dense_dim
             ctx.A_shape = A.shape
             ctx.B_shape = B.shape
 
-            sp.verify_coalescence(C)
+            sp.verify_coalescence(C, dense_dim=dense_dim)
             return C
 
         @staticmethod
         def backward(ctx, grad_output):
+            sparse_dim = ctx.sparse_dim
+            dense_dim = ctx.dense_dim
             A_shape = ctx.A_shape
             B_shape = ctx.B_shape
 
             if not (True in ctx.needs_input_grad):
                 return None, None
 
-            assert grad_output.is_coalesced(), 'If for some reason we get an uncoalesced grad_output here, we should check why and if justified, coalesce it.'
+            sp.verify_coalescence(grad_output, dense_dim=dense_dim), 'If for some reason we get an uncoalesced grad_output here, we should check why and if justified, coalesce it.'
 
             # Extracting the indices and values from grad_output
             grad_indices = grad_output.indices()
             grad_values = grad_output.values()
 
             if ctx.needs_input_grad[0]:
-                A_mask = grad_indices[-1, :] < A_shape[-1]
+                A_mask = grad_indices[-1, :] < A_shape[sparse_dim-1]
                 grad_A_indices = grad_indices[:, A_mask]
-                grad_A_values = grad_values[A_mask]
+                grad_A_values = grad_values[A_mask, ...]
                 grad_A = sp.sparse_coo_tensor_coalesced(grad_A_indices, grad_A_values, size=A_shape)
                 del A_mask, grad_A_indices, grad_A_values
             else:
                 grad_A = None
 
             if ctx.needs_input_grad[1]:
-                B_mask = grad_indices[-1, :] >= A_shape[-1]
+                B_mask = grad_indices[-1, :] >= A_shape[sparse_dim-1]
                 grad_B_indices = grad_indices[:, B_mask]
                 grad_B_indices[-1, :] -= A_shape[-1]
-                grad_B_values = grad_values[B_mask]
+                grad_B_values = grad_values[B_mask, ...]
                 grad_B = sp.sparse_coo_tensor_coalesced(grad_B_indices, grad_B_values, size=B_shape)
                 del B_mask, grad_B_indices, grad_B_values
             else:
                 grad_B = None
 
-            sp.verify_coalescence(grad_A)
-            sp.verify_coalescence(grad_B)
+            sp.verify_coalescence(grad_A, dense_dim=dense_dim)
+            sp.verify_coalescence(grad_B, dense_dim=dense_dim)
             return grad_A, grad_B
 
 
-    # Takes a sparse tensor whose dense dimension is 1 and returns a sparse tensor with the same shape, whose dense dimension is zero.
-    class flatten_dense_dim(torch.autograd.Function):
+
+    # Takes a sparse tensor whose dense dimension is 0 and returns a sparse tensor with the same shape, whose dense dimension is 1.
+    class unsqueeze_dense_dim(torch.autograd.Function):
         @staticmethod
-        def forward(ctx, sparse_tensor):
-            # Ensure the input is a sparse tensor with dense_dim = 1
-            assert sparse_tensor.is_sparse
-            assert sparse_tensor.dense_dim() == 1
+        def forward(ctx, A):
+            sp.verify_coalescence(A, dense_dim=0)
             
             # Save context for backward pass
-            ctx.shape = sparse_tensor.shape
+            ctx.A_shape = tuple(A.shape)
             
             # Extract indices and values
-            indices = sparse_tensor.indices()  # Shape: (sparse_dim, nnz)
-            values = sparse_tensor.values()    # Shape: (nnz, dense_dim)
+            indices = A.indices()  # Shape: (sparse_dim, nvals)
+            values = A.values()    # Shape: (nvals,)                
             
-            # Flatten the dense dimension into the sparse indices
-            nnz = values.size(0)
-            dense_dim = values.size(1)
+            # Reshape values to have a dense dimension of 1
+            values_out = values.view(-1, 1)
             
-            # Repeat indices for each dense element
-            expanded_indices = indices.repeat_interleave(dense_dim, dim=1)
-            
-            # Create new indices for the dense dimension
-            additional_indices = torch.arange(dense_dim, device=indices.device).repeat(nnz)
-            additional_indices = additional_indices.view(1, -1)
-            
-            # Combine sparse and new dense indices
-            combined_indices = torch.cat([expanded_indices, additional_indices], dim=0)
-            
-            # Flatten values
-            expanded_values = values.view(-1)
-            
-            # TODO: Try changing this to sparse_coo_tensor_coalesced
             # Create the output sparse tensor            
-            output_sparse_tensor = torch.sparse_coo_tensor(
-                combined_indices, 
-                expanded_values, 
-                sparse_tensor.size()[:-1] + (dense_dim,), 
-                device=sparse_tensor.device
-            ).coalesce()
+            output_sparse_tensor = sp.sparse_coo_tensor_coalesced(indices, values_out, ctx.A_shape + (1,))
             
             return output_sparse_tensor
 
         @staticmethod
         def backward(ctx, grad_output):
-            if grad_output.is_sparse:
-                # TODO: Check if this coalesce() is necessary
-                grad_output = grad_output.coalesce()
+            if not ctx.needs_input_grad[0]:
+                return None
+            
+            sp.verify_coalescence(grad_output, dense_dim=1)
 
-                indices = grad_output.indices()
-                values = grad_output.values()
+            indices = grad_output.indices()
+            values = grad_output.values()
 
-                # Reverse the transformation: re-construct the gradient for the original dense dimension
-                dense_dim = ctx.shape[-1]
+            # Reverse the transformation: remove the added dense dimension
+            values_out = values.view(-1)  # Flatten the values
+            
+            grad_input = sp.sparse_coo_tensor_coalesced(indices, values_out, ctx.A_shape)
+            
+            return grad_input
+        
 
-                arange_indices = torch.arange(0, indices.shape[1], dense_dim, device=indices.device)
-                reduced_indices = indices[:-1, arange_indices]
-                del indices, arange_indices
 
-                grad_values = values.view(-1, dense_dim)
-                del values
-
-                grad_input = torch.sparse_coo_tensor(reduced_indices, grad_values, ctx.shape, device=grad_output.device)
+    # Takes a sparse tensor whose dense dimension is 1 and returns a sparse tensor with the same shape, whose dense dimension is zero.
+    class flatten_dense_dim(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, A):
+            sp.verify_coalescence(A, dense_dim=1)
+            
+            # Save context for backward pass
+            ctx.shape = A.shape
+            
+            # Extract indices and values
+            indices = A.indices()  # Shape: (sparse_dim, nvals)
+            values = A.values()    # Shape: (nvals, dense_dim)
+            
+            # Flatten the dense dimension into the sparse indices
+            nvals_in = values.size(0)
+            nvals_out = values.numel()
+            dense_dim = values.size(1)            
+            
+            # Repeat indices for each dense element
+            if True:
+                # More efficient variant
+                indices_out = torch.empty((A.dim(), nvals_out), device=A.device, dtype=A.indices().dtype)
+                indices_out[0:-1, :] = indices.repeat_interleave(dense_dim, dim=1)
+                indices_out[-1, :] = torch.arange(dense_dim, device=indices.device).repeat(nvals_in).view(1, -1)
             else:
-                raise RuntimeError("Expected sparse gradient output")
+                # Clearer variant
+                expanded_indices = indices.repeat_interleave(dense_dim, dim=1)
+                
+                # Create new indices for the dense dimension
+                additional_indices = torch.arange(dense_dim, device=indices.device).repeat(nvals_in)
+                additional_indices = additional_indices.view(1, -1)
+                
+                # Combine sparse and new dense indices
+                indices_out = torch.cat([expanded_indices, additional_indices], dim=0)
+         
+            # Flatten values
+            values_out = values.view(-1)
+            
+            # Create the output sparse tensor            
+            output_sparse_tensor = sp.sparse_coo_tensor_coalesced(indices_out, values_out, A.shape)
+            
+            return output_sparse_tensor
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            if not ctx.needs_input_grad[0]:
+                return None
+            
+            sp.verify_coalescence(grad_output)
+
+            indices = grad_output.indices()
+            values = grad_output.values()
+
+            # Reverse the transformation: reconstruct the gradient for the original dense dimension
+            dense_dim = ctx.shape[-1]
+
+            arange_indices = torch.arange(0, indices.shape[1], dense_dim, device=indices.device)
+            reduced_indices = indices[:-1, arange_indices]
+            del indices, arange_indices
+
+            grad_values = values.view(-1, dense_dim)
+            del values
+
+            grad_input = sp.sparse_coo_tensor_coalesced(reduced_indices, grad_values, ctx.shape)
             
             return grad_input
 
@@ -1974,12 +2019,14 @@ class ag:
             return grad_input, None, None
 
 
-    # TODO: Make sure is efficient
+
     # Sorts a sparse tensor along a given dimension
     class sort_sparse(torch.autograd.Function):
         @staticmethod
         def forward(ctx, A, dim, descending):
             dim = dim if dim >= 0 else ( dim + A.dim() )
+
+            sp.verify_coalescence(A, dense_dim=0)
 
             # Extract indices and values
             inds = A.indices()
@@ -2011,7 +2058,6 @@ class ag:
                       
             # Reconstruct sorted sparse tensor
             out = sp.sparse_coo_tensor_coalesced(inds, vals[perm], A.shape)
-            #out = torch.sparse_coo_tensor(inds, vals[perm], A.shape).coalesce()
             
             # Save the original indices and sorted indices for backward
             if ctx.needs_input_grad[0]:
@@ -2023,8 +2069,7 @@ class ag:
         def backward(ctx, grad_output, aaa):
 
             if ctx.needs_input_grad[0]:
-                # TODO: See if we can get rid of this coalesce()
-                grad_output = grad_output.coalesce()
+                sp.verify_coalescence(grad_output)
 
                 inds = grad_output.indices()
                 vals = grad_output.values()
@@ -2032,7 +2077,7 @@ class ag:
                 vals_out = torch.empty(vals.shape[0], device=grad_output.device, dtype=grad_output.dtype)
                 vals_out[ctx.perm] = vals
                 del vals
-                grad_input = torch.sparse_coo_tensor(inds, vals_out, grad_output.shape)
+                grad_input = sp.sparse_coo_tensor_coalesced(inds, vals_out, grad_output.shape)
                 del inds
             else:
                 grad_input = None
@@ -2178,7 +2223,7 @@ class sp:
             assert (torch.sort(inds1d)[0] == inds1d).all(), 'indices are unique but not sorted'
 
         out = torch.sparse_coo_tensor(indices=indices, values=values, size=size, is_coalesced=True)
-        sp.verify_coalescence(out)
+        sp.verify_coalescence(out, dense_dim=out.dense_dim())
         return out   
 
 
@@ -2192,13 +2237,35 @@ class sp:
 
 
 
+    # returns a coalesced copy of A assuming that A contains several repetitions of the same set of indices, with each set being already coalesced
+    def coalesce_repeated(A, window_size):
+        assert A._indices().shape[1] % window_size == 0, 'coalesce_repeated: number of indices is not an integer multiple of copy_size'
+        num_repeats = A._indices().shape[1] // window_size
+
+        inds_out = A._indices()[:, 0:window_size]
+        vals_out = A._values()[0:window_size, ...]
+
+        for i in range(1, num_repeats):
+            if fsw_embedding_debug_mode:
+                assert (inds_out == A._indices()[:, (i*window_size):((i+1)*window_size)]).all(), 'coalesce_repeated: index mismatch between differnt windows'
+            vals_out += A._values()[(i*window_size):((i+1)*window_size), ...]
+        
+        #inds2, vals2 = sp.sort_inds_vals(indices=A._indices(), values=A._values(), shape=A.shape)
+        #del A
+        return sp.sparse_coo_tensor_coalesced(inds_out, vals_out, size=A.shape)
+
+
+
     # Verify that a sparse input tensor A is correctly coalesced.
-    def verify_coalescence(A):
+    def verify_coalescence(A, dense_dim=0):
         if A is None:
             return
         
-        if fsw_embedding_debug_mode:
-            assert A.is_coalesced(), 'verify_coalescence: input tensor is not coalesced'
+        assert A.is_sparse, 'verify_coalescence: input tensor is not sparse'
+        assert (dense_dim is None) or (A.dense_dim() == dense_dim), 'verify_coalescence: incorrect dense_dim(); expected %d, got %d' % (dense_dim, A.dense_dim())
+        assert A.is_coalesced(), 'verify_coalescence: input tensor is not coalesced'
+
+        if fsw_embedding_debug_mode:            
             B = torch.sparse_coo_tensor(indices=A.indices(), values=A.values(), size=A.shape).coalesce()
             assert (B.indices() == A.indices()).all(), 'verify_coalescence: index mismatch in input'
             assert (B.values() == A.values()).all(), 'verify_coalescence: value mismatch in input'
@@ -2449,95 +2516,96 @@ class sp:
 
 
     def get_slice_info(A, dim, calc_nnz_per_slice=False):
-        # TODO: Make sure we run this with no gradients to ensure speed
-        assert A.is_sparse, "input tensor must be sparse"
-        assert_coalesced(A)
-        
-        inds = A.indices()
-
-        # Shape of the sparse tensor
-        shape = list(A.shape)
-
-        dim = sp.dim_to_list(shape, dim)
-        
-        # Get the other dimensions excluding the one we're summing over,
-        # and get the shape along these dimensions.
-        dims2 = [d for d in range(len(shape)) if not d in dim]
-        shape2 = [shape[d] for d in range(len(shape)) if not d in dim]
-
-        if len(dims2) == 0:
-            if False:
-                keys = torch.zeros(A.values().numel(), device=inds.device, dtype=inds.dtype)            
-            else:
-                # This variant is slightly faster than the avove, since it creates keys as an expanded scalar tensor.
-                # Note that consequently, keys will not be contiguous.
-                # To deal with it, sum_sparse should call cumsum() instead of segcumsum() in this case, since there is only one segment.
-                keys = torch.zeros(1, device=inds.device, dtype=inds.dtype).expand(A.values().numel())
-        else:
-            keys = sp.ravel_index(inds[dims2,:], tuple(shape2)).view(-1)
-
-
-        variant = 1
-
-        # No need to sort if len(dims2) == 0
-        if len(dims2) == 0:
-            keys_sorted = keys
-            sort_inds = torch.arange(keys.numel(), device=keys.device, dtype=keys.dtype)
-        elif variant == 1:
-            # 2.74 seconds
-            keys_sorted, sort_inds = torch.sort(keys, dim=0, stable=True)
-        elif variant == 2:
-            # Note: If there is a memory problem, try to use this variant
-            sort_inds = torch.empty_like(keys)
-            keys_sorted, sort_inds = torch.sort(keys, dim=0, stable=True, out=(keys, sort_inds))
-
-        del keys
-
-        # variant 2 is roughly twice faster
-        variant = 2
-        if len(dims2) == 0:
-            one = torch.ones(1, device=keys_sorted.device, dtype=keys_sorted.dtype)
-            slice_ends = (keys_sorted.numel()-1)*one
-            slice_sizes = (keys_sorted.numel())*one
-            max_slice_nonzeros = int(keys_sorted.numel())
-
-        elif variant == 1:
-            one = torch.ones(1, device=keys_sorted.device, dtype=keys_sorted.dtype)
-
-            # Get the linear index in vals_sorted of the last index of each slice along dims
-            # 0.52 seconds
-            slice_ends = torch.nonzero(torch.diff(keys_sorted, n=1, dim=0, prepend=None, append=(keys_sorted.numel()-1)*one)).view(-1)
-            # 0.1 seconds
-            slice_sizes = torch.diff(slice_ends, n=1, dim=0, prepend=-one).view(-1)
-            max_slice_nonzeros = int(torch.max(slice_sizes))
-
-        elif variant == 2:
-            _, counts_consecutive = torch.unique_consecutive(keys_sorted, return_counts=True)
-            del _
-
-            slice_ends = counts_consecutive.cumsum(dim=0)-1
-            max_slice_nonzeros = int(torch.max(counts_consecutive))            
-
-        slice_info = { 'shape': shape,
-                      'dims': dim,
-                    'keys_sorted': keys_sorted,
-                    'sort_inds': sort_inds,
-                    'slice_ends': slice_ends,
-                    'num_slices': slice_ends.numel(),
-                    'max_slice_nonzeros': max_slice_nonzeros}
-
-
-        if calc_nnz_per_slice:
-            # TODO: Make sure this works
-            one = torch.ones(1, device=inds.device, dtype=torch.float64)
-            vals = one.repeat(A.values().numel())
-            A_mask = sp.sparse_coo_tensor_coalesced(indices=inds, values=vals, size=A.shape)
-            nnz_per_slice = sp.sum_sparse(A_mask, dim, slice_info=slice_info).to_dense().to(torch.int64)
-            del A_mask
+        # We run with no gradients to ensure speed
+        with torch.no_grad():
+            assert A.is_sparse, "input tensor must be sparse"
+            assert_coalesced(A)
             
-            slice_info['nnz_per_slice'] = nnz_per_slice
-        else: 
-            slice_info['nnz_per_slice'] = None
+            inds = A.indices()
+
+            # Shape of the sparse tensor
+            shape = list(A.shape)
+
+            dim = sp.dim_to_list(shape, dim)
+            
+            # Get the other dimensions excluding the one we're summing over,
+            # and get the shape along these dimensions.
+            dims2 = [d for d in range(len(shape)) if not d in dim]
+            shape2 = [shape[d] for d in range(len(shape)) if not d in dim]
+
+            if len(dims2) == 0:
+                if False:
+                    keys = torch.zeros(A.values().numel(), device=inds.device, dtype=inds.dtype)            
+                else:
+                    # This variant is slightly faster than the avove, since it creates keys as an expanded scalar tensor.
+                    # Note that consequently, keys will not be contiguous.
+                    # To deal with it, sum_sparse should call cumsum() instead of segcumsum() in this case, since there is only one segment.
+                    keys = torch.zeros(1, device=inds.device, dtype=inds.dtype).expand(A.values().numel())
+            else:
+                keys = sp.ravel_index(inds[dims2,:], tuple(shape2)).view(-1)
+
+
+            variant = 1
+
+            # No need to sort if len(dims2) == 0
+            if len(dims2) == 0:
+                keys_sorted = keys
+                sort_inds = torch.arange(keys.numel(), device=keys.device, dtype=keys.dtype)
+            elif variant == 1:
+                # 2.74 seconds
+                keys_sorted, sort_inds = torch.sort(keys, dim=0, stable=True)
+            elif variant == 2:
+                # Note: If there is a memory problem, try to use this variant
+                sort_inds = torch.empty_like(keys)
+                keys_sorted, sort_inds = torch.sort(keys, dim=0, stable=True, out=(keys, sort_inds))
+
+            del keys
+
+            # variant 2 is roughly twice faster
+            variant = 2
+            if len(dims2) == 0:
+                one = torch.ones(1, device=keys_sorted.device, dtype=keys_sorted.dtype)
+                slice_ends = (keys_sorted.numel()-1)*one
+                slice_sizes = (keys_sorted.numel())*one
+                max_slice_nonzeros = int(keys_sorted.numel())
+
+            elif variant == 1:
+                one = torch.ones(1, device=keys_sorted.device, dtype=keys_sorted.dtype)
+
+                # Get the linear index in vals_sorted of the last index of each slice along dims
+                # 0.52 seconds
+                slice_ends = torch.nonzero(torch.diff(keys_sorted, n=1, dim=0, prepend=None, append=(keys_sorted.numel()-1)*one)).view(-1)
+                # 0.1 seconds
+                slice_sizes = torch.diff(slice_ends, n=1, dim=0, prepend=-one).view(-1)
+                max_slice_nonzeros = int(torch.max(slice_sizes))
+
+            elif variant == 2:
+                _, counts_consecutive = torch.unique_consecutive(keys_sorted, return_counts=True)
+                del _
+
+                slice_ends = counts_consecutive.cumsum(dim=0)-1
+                max_slice_nonzeros = int(torch.max(counts_consecutive))            
+
+            slice_info = { 'shape': shape,
+                        'dims': dim,
+                        'keys_sorted': keys_sorted,
+                        'sort_inds': sort_inds,
+                        'slice_ends': slice_ends,
+                        'num_slices': slice_ends.numel(),
+                        'max_slice_nonzeros': max_slice_nonzeros}
+
+
+            if calc_nnz_per_slice:
+                # TODO: Make sure this works
+                one = torch.ones(1, device=inds.device, dtype=torch.float64)
+                vals = one.repeat(A.values().numel())
+                A_mask = sp.sparse_coo_tensor_coalesced(indices=inds, values=vals, size=A.shape)
+                nnz_per_slice = sp.sum_sparse(A_mask, dim, slice_info=slice_info).to_dense().to(torch.int64)
+                del A_mask
+                
+                slice_info['nnz_per_slice'] = nnz_per_slice
+            else: 
+                slice_info['nnz_per_slice'] = None
 
         return slice_info
 
