@@ -11,7 +11,7 @@ import sys
 import os
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
-from graphgps.layer.fsw_embedding import FSW_embedding, minimize_mutual_coherence, ag, sp
+from fsw_embedding import FSW_embedding, minimize_mutual_coherence, ag, sp
 
 # Release notes:
 #
@@ -27,8 +27,8 @@ from graphgps.layer.fsw_embedding import FSW_embedding, minimize_mutual_coherenc
 # - If the function to be learned is known to be invariant to vertex degrees, set 
 #   encode_vertex_degrees=False.
 
-@register_layer('sw_conv')
-class SW_conv(MessagePassing):
+@register_layer('fsw_conv')
+class FSW_conv(MessagePassing):
     # in_channels:    dimension of input vertex features
     #
     # out_channels:   dimension of output vertex features
@@ -205,7 +205,7 @@ class SW_conv(MessagePassing):
         
         self.size_coeff = torch.nn.Parameter( torch.ones(1, device=device, dtype=dtype) / np.sqrt(embed_dim), requires_grad=learnable_embedding)
 
-        self.fsw_embed = FSW_embedding(d_in=in_channels, d_out=embed_dim-1, d_edge=edgefeat_dim,
+        self.fsw_embed = FSW_embedding(d_in=in_channels, d_out=embed_dim, d_edge=edgefeat_dim,
                                        learnable_slices=learnable_embedding, learnable_freqs=False,
                                        encode_total_mass = encode_vertex_degrees, total_mass_encoding_method = embedding_total_mass_encoding_method, 
                                        minimize_slice_coherence=True, freqs_init='spread',
@@ -237,7 +237,7 @@ class SW_conv(MessagePassing):
         # vertex_degrees = degree(col, n, dtype=vertex_features.dtype).unsqueeze(-1)
 
         # Convert edge_index to sparse adjacency matrix
-        adj, X_edge, in_degrees = SW_conv.edge_index_to_adj(edge_index, edge_features=edge_features, num_vertices=n, edgefeat_dim=self.edgefeat_dim, dtype=vertex_features.dtype, edge_weighting=self.edge_weighting, self_loop_weight=self.self_loop_weight)
+        adj, X_edge, in_degrees = FSW_conv.edge_index_to_adj(edge_index, edge_features=edge_features, num_vertices=n, edgefeat_dim=self.edgefeat_dim, dtype=vertex_features.dtype, edge_weighting=self.edge_weighting, self_loop_weight=self.self_loop_weight)
                     
         # Aggregate neighboring vertex features
         emb = self.fsw_embed(X=vertex_features, W=adj, X_edge=X_edge, graph_mode=True, serialize_num_slices=None)
@@ -279,7 +279,7 @@ class SW_conv(MessagePassing):
             inds = torch.cat( (inds, inds2), dim=1 )
             vals = torch.cat( (vals, vals2), dim=0 )
 
-        adj = torch.sparse_coo_tensor(indices=inds, values=vals)          
+        adj = torch.sparse_coo_tensor(indices=inds, values=vals, size=(num_vertices,num_vertices))          
         adj = adj.coalesce()
 
         slice_info_W = sp.get_slice_info(adj, -1)
@@ -303,14 +303,15 @@ class SW_conv(MessagePassing):
         # Handle edge features
         if edgefeat_dim > 0:
             assert edge_features is not None, 'Edge features must be provided since edgefeat_dim > 0'
-            assert edge_features.dim() in (0,1), 'edge_features should have the shape (num_edges, edegfeat_dim) (or optionally (num_edges,) in the case edgefeat_dim=1)'
-            assert (edgefeat_dim == 1) or (edge_features.dim() == 1), 'edge_features must have the shape (num_edges, edgefeat_dim)'
+            assert edge_features.dim() in (1,2), 'edge_features should have the shape (num_edges, edegfeat_dim) (or optionally (num_edges,) in the case edgefeat_dim=1)'
+            assert (edgefeat_dim == 1) or (edge_features.dim() == 2), 'edge_features must have the shape (num_edges, edgefeat_dim)'
             if edgefeat_dim == 1:
-                assert tuple(edge_features.shape) in { tuple(num_edges,), tuple(num_edges, edgefeat_dim)}, 'edge_features should have the shape (num_edges, edegfeat_dim) (or optionally (num_edges,) in the case edgefeat_dim=1)'
+                assert tuple(edge_features.shape) in { (num_edges,), (num_edges, edgefeat_dim)}, 'edge_features should have the shape (num_edges, edegfeat_dim) (or optionally (num_edges,) in the case edgefeat_dim=1)'
             else:
-                assert tuple(edge_features.shape) == tuple(num_edges, edgefeat_dim), 'edge_features must have the shape (num_edges, edgefeat_dim)'
+                assert tuple(edge_features.shape) == (num_edges, edgefeat_dim), 'edge_features must have the shape (num_edges, edgefeat_dim)'
             X_edge_shape = adj.shape if edge_features.dim()==1 else tuple(adj.shape)+(edgefeat_dim,)
-            X_edge = torch.sparse_coo_tensor(indices=adj.indices, values=edge_features, size=X_edge_shape)
+            assert adj.is_coalesced()
+            X_edge = sp.sparse_coo_tensor_coalesced(indices=adj.indices(), values=edge_features, size=X_edge_shape)
 
         else:
             assert edge_features is None, 'Edge features should not be provided since edgefeat_dim = 0'
