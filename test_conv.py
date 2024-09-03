@@ -9,7 +9,7 @@ from fsw_conv import FSW_conv
 
 num_nodes = 100
 vertex_feature_dim = 50
-edge_feature_dim = 1
+edge_feature_dim = 10
 out_dim = 35
 edge_prob = 0.2
 

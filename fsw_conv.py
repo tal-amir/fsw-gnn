@@ -206,7 +206,7 @@ class FSW_conv(MessagePassing):
         self.size_coeff = torch.nn.Parameter( torch.ones(1, device=device, dtype=dtype) / np.sqrt(embed_dim), requires_grad=learnable_embedding)
 
         self.fsw_embed = FSW_embedding(d_in=in_channels, d_out=embed_dim, d_edge=edgefeat_dim,
-                                       learnable_slices=learnable_embedding, learnable_freqs=False,
+                                       learnable_slices=learnable_embedding, learnable_freqs=learnable_embedding,
                                        encode_total_mass = encode_vertex_degrees, total_mass_encoding_method = embedding_total_mass_encoding_method, 
                                        minimize_slice_coherence=True, freqs_init='spread',
                                        enable_bias=embedding_bias,
