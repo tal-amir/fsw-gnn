@@ -9,9 +9,28 @@ import torch_geometric.graphgym.register as register
 from torch_geometric.graphgym.register import register_layer
 import sys
 import os
+import importlib.util
+
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
-from fsw_embedding import FSW_embedding, minimize_mutual_coherence, ag, sp
+mydir = os.path.dirname(os.path.abspath(__file__))
+fsw_embedding_path = os.path.join(mydir, 'fsw_embedding.py')
+
+# The following is equivalent to:
+#from fsw_embedding import FSW_embedding, minimize_mutual_coherence, ag, sp
+
+# Load the module from the file path
+spec = importlib.util.spec_from_file_location("fsw_embedding", fsw_embedding_path)
+fsw_embedding = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fsw_embedding)
+
+# Access the items directly from the imported module
+FSW_embedding = fsw_embedding.FSW_embedding
+minimize_mutual_coherence = fsw_embedding.minimize_mutual_coherence
+ag = fsw_embedding.ag
+sp = fsw_embedding.sp
+
+# Now you can use FSW_embedding, minimize_mutual_coherence, ag, and sp directly
 
 # Release notes:
 #
