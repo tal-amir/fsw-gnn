@@ -99,7 +99,7 @@ libfsw_embedding = None
 
 # Turn this on to run some verifications and sanity checks during runtime.
 # If an error is encountered, a runtime error is raised
-fsw_embedding_debug_mode = True
+fsw_embedding_debug_mode = False
 
 # Conduct basic safety checks, mainly on the user input.
 # Recommended to leave True, unless running time is of utmost importance, and the input is known to be consistent.
@@ -109,6 +109,9 @@ fsw_embedding_basic_safety_checks = True
 # Tells whether to use float64 in numerically-challenging parts of the code even if the data is in float32 format.
 # This was not observed to increase accuracy, and it incurs a significantly narrower memory bottleneck and a slightly higher running time.
 fsw_embedding_high_precision = False
+
+# Produce a runtime error (rather than a warning) when failing to load the custom CUDA library
+fsw_embedding_produce_error_on_custom_library_loading_failure = True
 
 tal_global_timer = 0
 tal_global_timer_start = 0
@@ -192,10 +195,11 @@ class FSW_embedding(nn.Module):
                 libfsw_embedding = ctypes.CDLL(libfsw_embedding_path)
                 qprintln(report, 'Loaded custom CUDA library \'%s\'' % (libfsw_embedding_path))
             except OSError as e:
-                if self.user_warnings:
+                if fsw_embedding_produce_error_on_custom_library_loading_failure:
+                    raise RuntimeError('Error loading custom CUDA library \'%s\'. To circumvent this, set load_custom_cuda_lib=False at FSW_embedding() init, or set fsw_embedding_produce_error_on_custom_library_loading_failure=False at FSW_embedding.py code. This will use pure PyTorch code instead of the custom CUDA library, which is a bit slower.' % (libfsw_embedding_path))
+                elif self.user_warnings:
                     warnings.warn('Could not load custom CUDA library \'%s\'. Using pure torch implementation, which is a bit slower. (To silence, set user_warnings=False at FSW_embedding() init)' % (libfsw_embedding_path), UserWarning)
                 libfsw_embedding = None
-                # raise RuntimeError('Error loading custom CUDA library \'%s\'. Disable by setting load_custom_cuda_lib=False at FSW_embedding() init.' % (libfsw_embedding_path))
 
         # Process sizes
         assert d_in >= 0, 'd_in must be nonnegative'
