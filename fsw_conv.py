@@ -221,6 +221,8 @@ class FSW_conv(MessagePassing):
     def forward(self, vertex_features, edge_index, edge_features=None):
         # vertex_features has shape [num_vertices, in_channels]
         # edge_index has shape [2, num_edges]
+        # edge_features should be left None if edgefeat_dim == 0, or be of shape (num_edges, edgefeat_dim)
+        # with scalar features (i.e. edgefeat_dim == 1), edge_features can either be of shape (num_edges, 1) or (num_edges,)
 
         # Verify input
         assert vertex_features.dtype == self.fsw_embed.get_dtype(), 'vertex_features has incorrect dtype (expected %s, got %s)' % (self.fsw_embed.get_dtype(), vertex_features.dtype)
