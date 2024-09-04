@@ -65,6 +65,12 @@ class FSW_conv(MessagePassing):
     #                        better keep this on unless the learning task involved is known to be degree-invariant.
     #                        default: True
     #
+    # vertex_degree_encoding_function: tells what function to apply to vertex degrees before encoding. options:
+    #                                  'identity': f(x)=x
+    #                                  'sqrt': f(x) = sqrt(1+x)-1
+    #                                  'log': f(x) = log(1+x)
+    #                                  default: 'identity'
+    #
     # homog_degree_encoding: tells whether the neighborhood-size encoding should be homogeneous.
     #                        better keep this off unless it is desired that the model should be homogeneous.
     #                        NOTE: To make the whole model homogeneous, make sure bias=False and all activations are
@@ -128,7 +134,7 @@ class FSW_conv(MessagePassing):
     def __init__(self,
                  in_channels, out_channels, edgefeat_dim=0,
                  embed_dim=None, learnable_embedding=True,
-                 encode_vertex_degrees=True, homog_degree_encoding=False,
+                 encode_vertex_degrees=True, vertex_degree_encoding_function='identity', homog_degree_encoding=False, 
                  concat_self = True,
                  bias=True,
                  mlp_layers=1, mlp_hidden_dim=None,
@@ -143,6 +149,7 @@ class FSW_conv(MessagePassing):
         super().__init__(aggr=None)
 
         assert edge_weighting in {'unit', 'gcn'}, 'invalid value passed in argument <edge_weighting>'
+        assert vertex_degree_encoding_function in {'identity', 'sqrt', 'log'}, 'invalid value passed in argument <vertex_degree_encoding_function>'
 
         if mlp_hidden_dim is None:
             mlp_hidden_dim = max(in_channels, out_channels)
@@ -226,7 +233,9 @@ class FSW_conv(MessagePassing):
 
         self.fsw_embed = FSW_embedding(d_in=in_channels, d_out=embed_dim, d_edge=edgefeat_dim,
                                        learnable_slices=learnable_embedding, learnable_freqs=learnable_embedding,
-                                       encode_total_mass = encode_vertex_degrees, total_mass_encoding_method = embedding_total_mass_encoding_method, 
+                                       encode_total_mass = encode_vertex_degrees, 
+                                       total_mass_encoding_function = vertex_degree_encoding_function,
+                                       total_mass_encoding_method = embedding_total_mass_encoding_method, 
                                        minimize_slice_coherence=True, freqs_init='spread',
                                        enable_bias=embedding_bias,
                                        device=device, dtype=dtype)
@@ -341,3 +350,57 @@ class FSW_conv(MessagePassing):
 
 
         return adj, X_edge, in_degrees
+
+
+
+#@register_pooling('fsw_readout')
+class FSW_readout(FSW_conv):
+    # What is the @register_pooling decorator?
+    # What is the input format? Shapes?
+    # - Is 'batch' the batch index?
+    # - So the number of batches is the maximal batch index?
+    # - What if some indices in the range are absent? 
+    #   Are they considered empty graphs that are part of the batch? Do we return a global feature for them as well?
+    # - Currently I am not updating the edge features. Do competing methods do it?
+    
+    def forward(self, vertex_features, batch=None):
+        # create batch numbering for single graph if needed
+        if batch is None:
+            batch = torch.zeros(vertex_features.shape[0]).long().to(vertex_features.device)
+          
+        self.batch_size = batch.max().item() + 1
+        self.num_vertices = vertex_features.shape[0]
+        # setting edge index so all nodes are connected to the first node per graph
+        src = torch.arange(self.num_vertices, device=vertex_features.device)
+        #dst = torch.cat([torch.ones(num_nodes[i], device=vertex_features.device)*self.first_node_index[i] for i in range(0, len(num_nodes))], dim=0)
+        dst = batch
+        edge_index = torch.stack([src, dst], dim=0).long().to(vertex_features.device)
+        vals = torch.ones_like(edge_index[0,:], dtype=vertex_features.dtype)
+        
+        #adj = torch.sparse_coo_tensor(edge_index.flip(0), vals, (self.batch_size, self.num_vertices), is_coalesced=False).coalesce()
+        adj = torch.sparse_coo_tensor(edge_index.flip(0), vals, (self.batch_size, self.num_vertices), is_coalesced=True)
+        
+        slice_info_W = sp.get_slice_info(adj, -1)
+        in_degrees = ag.sum_sparseToDense.apply(adj, -1, slice_info_W)
+        ################################################################################################
+
+        
+        # Aggregate neighboring vertex features
+        emb = self.sw_embed(X=vertex_features, W=adj, graph_mode=True, serialize_num_slices=None)
+        
+
+        # Add neighborhood sizes multiplied by the norms of the neighborhood embeddings, and optionally also the self feature of each vertex
+        emb_cat_list = (vertex_features,) if self.concat_self else ()
+        emb_cat_list = emb_cat_list + (emb, (self.size_coeff*in_degrees*emb.norm(dim=-1,keepdim=True)))
+        emb = torch.cat(emb_cat_list, dim=-1)
+        
+        # Apply MLP or dimensionality reduction to neighborhood embeddings
+        if self.mlp is not None:
+            out = self.mlp(emb)
+        elif self.concat_self:
+            out = torch.matmul(emb, self.dim_reduct.transpose(0,1))
+        else:
+            out = emb
+
+        return out
+    

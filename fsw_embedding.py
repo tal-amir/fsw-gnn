@@ -4,8 +4,8 @@
 # Technion Institute of Technology
 # Haifa, Israel
 
-version = '2.11'
-version_date = '2024-00-02'
+version = '2.12'
+version_date = '2024-00-04'
 
 # Edge features:
 # - Do not split self.projVecs. Do self.projVecs.shape[1] == d_in + d_edge.
@@ -32,6 +32,7 @@ version_date = '2024-00-02'
 #    directly from a saved state_dict.
 
 # Changelog:
+# 2.12    added support for total_mass_encoding_function
 # 2.11    fixed sparse padding bug
 # 2.1     added full edge-feature support
 # 2.09a   edge feature support is working (beta)
@@ -173,6 +174,7 @@ class FSW_embedding(nn.Module):
                  nSlices : int | None = None, nFreqs : int | None = None, collapse_freqs : bool = False,
                  d_edge : int = 0, # dimension of edge feature vectors. requires calling forward() with graph_mode=True
                  encode_total_mass : bool = False, # Tells whether to encode the input multiset sizes (a.k.a. total mass) in the embedding
+                 total_mass_encoding_function : str = 'identity', # 'identity' : f(x)=x, 'sqrt' : f(x) = sqrt(1+x)-1, 'log' : log(1+x)
                  total_mass_encoding_method : str = 'plain', # 'plain' / 'homog' / 'homog_alt'
                  total_mass_pad_thresh : float | int = 1.0, # Multisets/mesaures with a total mass below that threshold get padded with the complementary mass placed at x=0
                  learnable_slices : bool = False, learnable_freqs : bool = False, learnable_powers : bool = False,
@@ -225,6 +227,9 @@ class FSW_embedding(nn.Module):
 
         assert total_mass_encoding_method in {'plain','homog','homog_alt'}, '<total_mass_encoding_method> must be one of \'plain\', \'homog\', \'homog_alg\''
         self.total_mass_encoding_method = total_mass_encoding_method
+
+        assert total_mass_encoding_function in {'identity','sqrt','log'}, '<total_mass_encoding_function> must be one of \'identity\', \'sqrt\', \'log\''
+        self.total_mass_encoding_function = total_mass_encoding_function        
 
         if self.d_edge == 0:
             input_space_name = 'R^%d' % (self.d_in)
@@ -724,9 +729,6 @@ class FSW_embedding(nn.Module):
                     if X_edge.dense_dim()==0:
                         X_edge = ag.unsqueeze_dense_dim.apply(X_edge)
                     
- 
-
-
 
         ### C. Precalculate axis indices and output shape
              
@@ -826,15 +828,29 @@ class FSW_embedding(nn.Module):
             X_emb = torch.flatten(X_emb, start_dim=element_axis, end_dim=element_axis+1)
 
         if self.encode_total_mass:
+            if self.total_mass_encoding_function == 'identity':
+                total_mass = W_sum
+            elif self.total_mass_encoding_function == 'sqrt':
+                # x/(sqrt(x+1)+1) is a numerically-safe formulation of sqrt(1+x)-1
+                # note that we don't use sqrt(1+x) since we need the function to vanish at x=0,
+                # and we don't use sqrt(x) since we need it to have a gradient at x=0.
+                total_mass = W_sum / ( torch.sqrt(W_sum + 1) + 1)
+            elif self.total_mass_encoding_function == 'log':
+                total_mass = torch.log1p(W_sum)
+            else:
+                raise RuntimeError('This should not happen')
+            
+            del W_sum
+            
             if self.total_mass_encoding_method == 'plain':
-                X_emb = torch.cat( (W_sum, X_emb), dim=-1)
+                X_emb = torch.cat( (total_mass, X_emb), dim=-1)
             elif self.total_mass_encoding_method == 'homog':
                 X_emb_norm = torch.mean(X_emb.abs(), dim=-1, keepdim=True)
-                X_emb = torch.cat( (W_sum * X_emb_norm, X_emb), dim=-1)
+                X_emb = torch.cat( (total_mass * X_emb_norm, X_emb), dim=-1)
             elif self.total_mass_encoding_method == 'homog_alt':
                 X_emb_norm = torch.mean(X_emb.abs(), dim=-1, keepdim=True)
-                X_emb = torch.cat( (FSW_embedding.total_mass_homog_alt_encoding_part1(W_sum) * X_emb_norm,
-                                    FSW_embedding.total_mass_homog_alt_encoding_part2(W_sum) * X_emb), dim=-1)            
+                X_emb = torch.cat( (FSW_embedding.total_mass_homog_alt_encoding_part1(total_mass) * X_emb_norm,
+                                    FSW_embedding.total_mass_homog_alt_encoding_part2(total_mass) * X_emb), dim=-1)            
             else:
                 raise RuntimeError('This should not happen')
 

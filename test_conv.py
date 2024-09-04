@@ -15,6 +15,7 @@ edge_prob = 0.2
 
 is_homogeneous = False
 squeeze_edge_features_when_possible = True # squeezes the edge features' last dimension and makes them scalar when edge_feature_dim = 1
+vertex_degree_encoding_function = 'log'
 
 test_grad = True
 test_homogeneity = True
@@ -39,7 +40,8 @@ if squeeze_edge_features_when_possible and (edge_feature_dim==1):
 # Create a PyTorch Geometric data object
 data = Data(x=node_features, edge_index=edge_index)
 
-conv = FSW_conv(vertex_feature_dim, out_dim, edgefeat_dim=edge_feature_dim, mlp_layers=3, bias=not is_homogeneous, homog_degree_encoding=is_homogeneous, concat_self = True, batchNorm_final=True, device=device, dtype=dtype)
+conv = FSW_conv(vertex_feature_dim, out_dim, edgefeat_dim=edge_feature_dim, mlp_layers=3, bias=not is_homogeneous,
+                vertex_degree_encoding_function=vertex_degree_encoding_function, homog_degree_encoding=is_homogeneous, concat_self = True, batchNorm_final=True, device=device, dtype=dtype)
 
 conv.eval()
 
@@ -62,5 +64,5 @@ if test_homogeneity:
     if is_homogeneous:
         print('Relative deviation from homogeneity: ', torch.norm(out2-16*out).item() / torch.norm(out).item())
     else:
-        print('Relative deviation from homogeneity: ', torch.norm(out2-16*out).item() / torch.norm(out).item(), '(ok if > 0 since is_homogeneous=False)')
+        print('Relative deviation from homogeneity: ', torch.norm(out2-16*out).item() / torch.norm(out).item(), '(this is ok since is_homogeneous=False)')
 
