@@ -834,7 +834,7 @@ class FSW_embedding(nn.Module):
                 # x/(sqrt(x+1)+1) is a numerically-safe formulation of sqrt(1+x)-1
                 # note that we don't use sqrt(1+x) since we need the function to vanish at x=0,
                 # and we don't use sqrt(x) since we need it to have a gradient at x=0.
-                total_mass = W_sum / ( torch.sqrt(W_sum + 1) + 1)
+                total_mass = 2*( W_sum / ( torch.sqrt(W_sum + 1) + 1) )
             elif self.total_mass_encoding_function == 'log':
                 total_mass = torch.log1p(W_sum)
             else:

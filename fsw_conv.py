@@ -6,7 +6,7 @@ from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import add_self_loops, degree
 from torch_geometric.graphgym import cfg
 import torch_geometric.graphgym.register as register
-from torch_geometric.graphgym.register import register_layer
+from torch_geometric.graphgym.register import register_layer, register_pooling
 import sys
 import os
 import importlib.util
@@ -36,8 +36,8 @@ sp = fsw_embedding.sp
 #
 # 2024-09-03
 # - Added support for edge features.
-#   To use, set edgefeat_dim > 0 at init, and pass argument X_edge in forward(),
-#   where X_edge is a tensor of size (num of edges, edgefeat_dim)
+#   To use, set edgefeat_dim > 0 at init, and pass argument edge_features in forward(),
+#   where edge_features is a tensor of size (num of edges, edgefeat_dim)
 # - Elegant handling of empty neighborhoods => No need to use self_loop_weight > 0 anymore.
 # - Added built-in support to make the whole model homogeneous w.r.t. the vertex- and edge-features.
 #   To make the model homogeneous: (1) use homog_degree_encoding = True, (2) use bias=False, and
@@ -353,46 +353,63 @@ class FSW_conv(MessagePassing):
 
 
 
-#@register_pooling('fsw_readout')
+@register_pooling('fsw_readout')
 class FSW_readout(FSW_conv):
-    # What is the @register_pooling decorator?
-    # What is the input format? Shapes?
-    # - Is 'batch' the batch index?
-    # - So the number of batches is the maximal batch index?
-    # - What if some indices in the range are absent? 
-    #   Are they considered empty graphs that are part of the batch? Do we return a global feature for them as well?
-    # - Currently I am not updating the edge features. Do competing methods do it?
-    
-    def forward(self, vertex_features, batch=None):
+    def forward(self, vertex_features, graph_index=None, batch_size=None):
+        # vertex_features: tensor of size [num_vertices, vertex_feature_dimension], where num_vertices is the total number of vertices in the whole batch.
+        # 
+        # graph_index: tensor of size [num_vertices,]. for each vertex, tells which graph in the batch it belongs to.
+        #              if None, assumes the batch consists of a single graph.
+        #
+        # batch_size:  number of graphs in the batch. 
+        #              if None, this number is determined automatically as max(graph_index)+1.
+        #
+        # NOTE: Graphs whose index is in the range 0,...,batch_size-1 that are not assigned any vertices
+        #       are treated as empty graphs that are still part of the input, and an output embedding is generated for them a well.
+        #
+        # Output shape: [out_channels, batch_size]
+
+        # TODO: This check should better be done in a custom __init__ method of this class.
+        assert self.edgefeat_dim == 0, 'edgefeat_dim should equal zero in a global readout layer'
+
+        num_vertices = vertex_features.shape[0]
+
+        if graph_index is None:
+            assert batch_size is None, 'batch_size must be None when graph_index is None'
+        else:
+            assert tuple(graph_index.shape) == (num_vertices,), 'graph_index should be of shape (num_vertices,), where vertex_features is of shape (num_features, vertex_feature_dimension)'
+            assert is_monotone_increasing(graph_index), 'for efficiency, graph_index should be monotone non-decreasing'
+
         # create batch numbering for single graph if needed
-        if batch is None:
-            batch = torch.zeros(vertex_features.shape[0]).long().to(vertex_features.device)
-          
-        self.batch_size = batch.max().item() + 1
-        self.num_vertices = vertex_features.shape[0]
-        # setting edge index so all nodes are connected to the first node per graph
-        src = torch.arange(self.num_vertices, device=vertex_features.device)
-        #dst = torch.cat([torch.ones(num_nodes[i], device=vertex_features.device)*self.first_node_index[i] for i in range(0, len(num_nodes))], dim=0)
-        dst = batch
-        edge_index = torch.stack([src, dst], dim=0).long().to(vertex_features.device)
-        vals = torch.ones_like(edge_index[0,:], dtype=vertex_features.dtype)
-        
-        #adj = torch.sparse_coo_tensor(edge_index.flip(0), vals, (self.batch_size, self.num_vertices), is_coalesced=False).coalesce()
-        adj = torch.sparse_coo_tensor(edge_index.flip(0), vals, (self.batch_size, self.num_vertices), is_coalesced=True)
-        
-        slice_info_W = sp.get_slice_info(adj, -1)
-        in_degrees = ag.sum_sparseToDense.apply(adj, -1, slice_info_W)
-        ################################################################################################
+        if graph_index is None:
+            graph_index = torch.zeros(vertex_features.shape[0], device=vertex_features.device, dtype=torch.int64)
 
-        
-        # Aggregate neighboring vertex features
-        emb = self.sw_embed(X=vertex_features, W=adj, graph_mode=True, serialize_num_slices=None)
-        
+        # automatically determine batch_size if not provided  
+        batch_size = graph_index.max().item() + 1 if batch_size is None else batch_size
 
-        # Add neighborhood sizes multiplied by the norms of the neighborhood embeddings, and optionally also the self feature of each vertex
-        emb_cat_list = (vertex_features,) if self.concat_self else ()
-        emb_cat_list = emb_cat_list + (emb, (self.size_coeff*in_degrees*emb.norm(dim=-1,keepdim=True)))
-        emb = torch.cat(emb_cat_list, dim=-1)
+        assert (graph_index < batch_size).all(), 'all entries of graph_index must be in the range 0,...,batch_size-1'
+        assert (graph_index >= 0).all(), 'all entries of graph_index must be in the range 0,...,batch_size-1'
+
+        # Check device and dtype of input for compatibility
+        assert vertex_features.device == self.fsw_embed.get_device(), 'invalid device given in vertex_features (expected \'%s\', got \'%s\'' % (str(self.fsw_embed.get_device()), str(vertex_features.device))
+        assert graph_index.device == self.fsw_embed.get_device(), 'invalid device given in graph_index (expected \'%s\', got \'%s\'' % (str(self.fsw_embed.get_device()), str(graph_index.device))
+
+        assert vertex_features.dtype == self.fsw_embed.get_dtype(), 'invalid dtype given in vertex_features (expected \'%s\', got \'%s\'' % (str(self.fsw_embed.get_dtype()), str(vertex_features.dtype))
+        assert graph_index.dtype == torch.int64, 'invalid dtype given in graph_index (expected \'%s\', got \'%s\'' % (str(torch.int64), str(graph_index.dtype))
+
+        # creating edges from all vertices to the corresponding global node of their graph
+        src = torch.arange(num_vertices, device=vertex_features.device)
+        dst = graph_index
+
+        # Create sparse adjacency matrix.
+        # Note that we use [dst, src] in adj_indices since the adjacency matrix is given in the format: adj[i,j] = weight of the edge from j to i
+        adj_indices = torch.stack([dst, src], dim=0).long()
+        adj_vals = torch.ones_like(adj_indices[0,:], dtype=vertex_features.dtype)
+        
+        adj = sp.sparse_coo_tensor_coalesced(adj_indices, adj_vals, (batch_size, num_vertices))
+               
+        # Aggregate global graph features
+        emb = self.fsw_embed(X=vertex_features, W=adj, graph_mode=True, serialize_num_slices=None)
         
         # Apply MLP or dimensionality reduction to neighborhood embeddings
         if self.mlp is not None:
@@ -404,3 +421,10 @@ class FSW_readout(FSW_conv):
 
         return out
     
+
+def is_monotone_increasing(tensor):
+    # Compute the difference between consecutive elements
+    diffs = tensor[1:] - tensor[:-1]
+    
+    # Check if all differences are greater than or equal to 0
+    return torch.all(diffs >= 0)
