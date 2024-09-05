@@ -656,7 +656,7 @@ class FSW_embedding(nn.Module):
         if X_edge is not None:
             assert torch.is_tensor(W), 'When X_edge is provided, W must be provided explicitly'
             assert (X_edge.device == self.get_device()), ( "X_edge is on the wrong device. Expected %s, got %s" % (self.get_device(), X_edge.device) )
-            assert (X_edge.dtype == self.get_dtype()), ( "X_edge has the wrong dtype. Expected %s, got %s" % (self.get_dtype(), X.dtype) )        
+            assert (X_edge.dtype == self.get_dtype()), ( "X_edge has the wrong dtype. Expected %s, got %s" % (self.get_dtype(), X_edge.dtype) )        
 
             if X_edge.is_sparse or X_edge.layout != torch.strided:
                 assert X_edge.layout == torch.sparse_coo, ( "Sparse X_edge has an unsupported sparsity layout '%s'. Only the COO layout (torch.sparse_coo) is currently supported." % (X_edge.layout) )
