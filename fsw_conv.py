@@ -124,7 +124,9 @@ class FSW_conv(MessagePassing):
     #
     # batchNorm_final, batchNorm_hidden:
     #                 Tell whether to apply batch normalization to the outputs of the final and hidden layers.
-    #                 The normalization is applied after the linear layer and before the activation.
+    #                 If mlp_layers > 0, the normalization is applied after the linear layer and before the activation.
+    #                 If mlp_layers = 0, the normalization is applied at the very last step, i.e. after embedding and, when applicable,
+    #                 self-concatenation and dimensionality reduction.
     #                 Defaults: False
     #
     # dropout_final, dropout_hidden:
@@ -174,7 +176,7 @@ class FSW_conv(MessagePassing):
         if concat_self:
             mlp_input_dim = in_channels + embed_dim
         else:
-            mlp_input_dim = embed_dim
+            mlp_input_dim = embed_dim        
 
         # construct MLP
         if mlp_layers == 0:
@@ -186,7 +188,12 @@ class FSW_conv(MessagePassing):
                     dim_reduct = minimize_mutual_coherence(dim_reduct, report=False)
                 
                 self.dim_reduct = torch.nn.Parameter(dim_reduct, requires_grad=learnable_embedding)
+
+            # Batch-normalization to apply to the output when an MLP is not used
+            self.bn_final = torch.nn.BatchNorm1d(num_features=out_channels, device=device, dtype=dtype) if batchNorm_final else None
+
         else:
+            self.bn_final = None
             mlp_modules = []
             
             for i in range(mlp_layers):
@@ -282,6 +289,9 @@ class FSW_conv(MessagePassing):
             out = torch.matmul(emb, self.dim_reduct.transpose(0,1))
         else:
             out = emb
+
+        if self.bn_final is not None:
+            out = self.bn_final(out)
 
         return out
 
