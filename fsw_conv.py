@@ -11,6 +11,10 @@ import sys
 import os
 import importlib.util
 
+import type_enforced # Note: A runtime error in this line implies that that some function below is given an input arguemnt of the wrong type
+from typing import Dict, Any
+import inspect
+
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 mydir = os.path.dirname(os.path.abspath(__file__))
@@ -47,6 +51,7 @@ sp = fsw_embedding.sp
 #   encode_vertex_degrees=False.
 
 @register_layer('fsw_conv')
+@type_enforced.Enforcer(enabled=True)
 class FSW_conv(MessagePassing):
     # in_channels:    dimension of input vertex features
     #
@@ -133,6 +138,11 @@ class FSW_conv(MessagePassing):
     #                 Dropout probabilities 0 <= p < 1 to be used at the final and hidden layers of the MLP.
     #                 The order of each layer is:  Linear transformation -> Batch normalization -> Activation -> Dropout
     #                 Defaults: 0
+    #
+    # config:         dictionary with settings that are to override the input arguments.
+    #                 for example, __init__(in_channels = 5, ..., config={'in_channels':10})
+    #                 will use in_channels = 10.
+    #                 default: None
     def __init__(self,
                  in_channels, out_channels, edgefeat_dim=0,
                  embed_dim=None, learnable_embedding=True,
@@ -146,10 +156,48 @@ class FSW_conv(MessagePassing):
                  batchNorm_final = False, batchNorm_hidden = False,
                  dropout_final = 0, dropout_hidden = 0,
                  self_loop_weight = 0, edge_weighting = 'unit',
-                 device=None, dtype=torch.float32):
+                 device=None, dtype=torch.float32,
+                 config : dict | None = None):
         
         super().__init__(aggr=None)
 
+        config = config if config is not None else {}
+
+        # Get the function's input argument names
+        # This is in case the function is not a method:
+        #frame = inspect.currentframe()
+        #function_name = frame.f_code.co_name
+        #func = globals()[function_name]
+        func = getattr(self.__class__, '__init__', None)
+        arg_names = { param.name for param in inspect.signature(func).parameters.values() }
+        arg_names = arg_names.difference({'config','self'})
+
+        # Override input arguments by arguments given in config
+        for key in config:
+            if key not in arg_names:
+                raise ValueError(f"Invalid argument '{key}' in config")            
+            
+        for argname in arg_names:
+            if argname not in config:
+                config[argname] = locals()[argname]
+
+        self.init_helper(**config)
+    
+
+    def init_helper(self,
+                    in_channels, out_channels, edgefeat_dim,
+                    embed_dim, learnable_embedding,
+                    encode_vertex_degrees, vertex_degree_encoding_function, homog_degree_encoding, 
+                    concat_self,
+                    bias,
+                    mlp_layers, mlp_hidden_dim,
+                    mlp_activation_final, 
+                    mlp_activation_hidden, 
+                    mlp_init,
+                    batchNorm_final, batchNorm_hidden,
+                    dropout_final, dropout_hidden,
+                    self_loop_weight, edge_weighting,
+                    device, dtype):
         assert edge_weighting in {'unit', 'gcn'}, 'invalid value passed in argument <edge_weighting>'
         assert vertex_degree_encoding_function in {'identity', 'sqrt', 'log'}, 'invalid value passed in argument <vertex_degree_encoding_function>'
 
