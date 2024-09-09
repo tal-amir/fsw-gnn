@@ -68,6 +68,7 @@ class FSW_conv(MessagePassing):
     #
     # encode_vertex_degrees: tells whether to encode the in-degree of each vertex as part of its neighborhood embedding.
     #                        better keep this on unless the learning task involved is known to be degree-invariant.
+    #                        note that 'vertex degree' here refers to the sum of weights of incoming edges to that vertex.
     #                        default: True
     #
     # vertex_degree_encoding_function: tells what function to apply to vertex degrees before encoding. options:
@@ -81,6 +82,12 @@ class FSW_conv(MessagePassing):
     #                        NOTE: To make the whole model homogeneous, make sure bias=False and all activations are
     #                              homogeneous (e.g. leaky ReLU).
     #                        default: False
+    #
+    # vertex_degree_pad_thresh: vertices with degrees smaller than this threshold (after adding self loops)
+    #                           are padded with an incoming neighbor whose vertex feature is zero and a corresponding edge
+    #                           weight ( vertex_degree_pad_thresh - <this vertex's degree> ).
+    #                           can be any positive number. better leave this value at the default 1.0.
+    #                           default: 1.0
     #
     # concat_self: when set to True, the embedding of each vertex's neighborhood is concatenated to its own
     #              feature vector before it is passed to the MLP. If <mlp_layers> = 0, then dimensionality reduction
@@ -147,6 +154,7 @@ class FSW_conv(MessagePassing):
                  in_channels, out_channels, edgefeat_dim=0,
                  embed_dim=None, learnable_embedding=True,
                  encode_vertex_degrees=True, vertex_degree_encoding_function='identity', homog_degree_encoding=False, 
+                 vertex_degree_pad_thresh = 1.0,
                  concat_self = True,
                  bias=True,
                  mlp_layers=1, mlp_hidden_dim=None,
@@ -184,10 +192,12 @@ class FSW_conv(MessagePassing):
         self.init_helper(**config)
     
 
+    # The input arguments here should be the same as in __init__, except for 'config' which is omitted here.
     def init_helper(self,
                     in_channels, out_channels, edgefeat_dim,
                     embed_dim, learnable_embedding,
                     encode_vertex_degrees, vertex_degree_encoding_function, homog_degree_encoding, 
+                    vertex_degree_pad_thresh,
                     concat_self,
                     bias,
                     mlp_layers, mlp_hidden_dim,
@@ -291,6 +301,7 @@ class FSW_conv(MessagePassing):
                                        encode_total_mass = encode_vertex_degrees, 
                                        total_mass_encoding_function = vertex_degree_encoding_function,
                                        total_mass_encoding_method = embedding_total_mass_encoding_method, 
+                                       total_mass_pad_thresh = vertex_degree_pad_thresh,
                                        minimize_slice_coherence=True, freqs_init='spread',
                                        enable_bias=embedding_bias,
                                        device=device, dtype=dtype)
@@ -399,7 +410,17 @@ class FSW_conv(MessagePassing):
                 assert tuple(edge_features.shape) == (num_edges, edgefeat_dim), 'edge_features must have the shape (num_edges, edgefeat_dim)'
             X_edge_shape = adj.shape if edge_features.dim()==1 else tuple(adj.shape)+(edgefeat_dim,)
             assert adj.is_coalesced()
-            X_edge = sp.sparse_coo_tensor_coalesced(indices=adj.indices(), values=edge_features, size=X_edge_shape)
+
+            if self_loop_weight > 0:
+                s = list(edge_features.shape)
+                s[0] = num_vertices
+                edge_features_pad = torch.zeros(s, device=edge_index.device, dtype=dtype)
+                edge_features = torch.cat( (edge_features, edge_features_pad), dim=0 )
+
+                s = list(adj.shape)
+
+            X_edge = torch.sparse_coo_tensor(indices=inds, values=edge_features, size=X_edge_shape)
+            X_edge = X_edge.coalesce()
 
         else:
             assert edge_features is None, 'Edge features should not be provided since edgefeat_dim = 0'

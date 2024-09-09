@@ -9,11 +9,11 @@ from fsw_conv import FSW_conv
 
 num_nodes = 100
 vertex_feature_dim = 50
-edge_feature_dim = 10
+edge_feature_dim = 11
 out_dim = 35
 edge_prob = 0.2
 
-is_homogeneous = False
+is_homogeneous = True
 squeeze_edge_features_when_possible = True # squeezes the edge features' last dimension and makes them scalar when edge_feature_dim = 1
 vertex_degree_encoding_function = 'log'
 
@@ -41,7 +41,7 @@ if squeeze_edge_features_when_possible and (edge_feature_dim==1):
 data = Data(x=node_features, edge_index=edge_index)
 
 conv = FSW_conv(vertex_feature_dim, out_dim, edgefeat_dim=edge_feature_dim, mlp_layers=3, bias=not is_homogeneous,
-                vertex_degree_encoding_function=vertex_degree_encoding_function, homog_degree_encoding=is_homogeneous, concat_self = True, batchNorm_final=True, device=device, dtype=dtype)
+                vertex_degree_encoding_function=vertex_degree_encoding_function, homog_degree_encoding=is_homogeneous, concat_self = True, batchNorm_final=True, device=device, dtype=dtype, self_loop_weight=0)
 
 conv.eval()
 
