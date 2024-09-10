@@ -41,7 +41,11 @@ if squeeze_edge_features_when_possible and (edge_feature_dim==1):
 data = Data(x=node_features, edge_index=edge_index)
 
 conv = FSW_conv(vertex_feature_dim, out_dim, edgefeat_dim=edge_feature_dim, mlp_layers=3, bias=not is_homogeneous,
-                vertex_degree_encoding_function=vertex_degree_encoding_function, homog_degree_encoding=is_homogeneous, concat_self = True, batchNorm_final=True, device=device, dtype=dtype, self_loop_weight=0)
+                vertex_degree_encoding_function=vertex_degree_encoding_function, 
+                vertex_degree_encoding_scale=10,
+                homog_degree_encoding=is_homogeneous, 
+                learnable_embedding = True,
+                concat_self = True, batchNorm_final=True, device=device, dtype=dtype, self_loop_weight=0.2)
 
 conv.eval()
 

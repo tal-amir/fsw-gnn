@@ -4,8 +4,8 @@
 # Technion Institute of Technology
 # Haifa, Israel
 
-version = '2.12'
-version_date = '2024-00-04'
+version = '2.13'
+version_date = '2024-00-10'
 
 # Edge features:
 # - Do not split self.projVecs. Do self.projVecs.shape[1] == d_in + d_edge.
@@ -32,6 +32,7 @@ version_date = '2024-00-04'
 #    directly from a saved state_dict.
 
 # Changelog:
+# 2.13    added support for total_mass_encoding_scale
 # 2.12    added support for total_mass_encoding_function
 # 2.11    fixed sparse padding bug
 # 2.1     added full edge-feature support
@@ -175,9 +176,10 @@ class FSW_embedding(nn.Module):
                  d_edge : int = 0, # dimension of edge feature vectors. requires calling forward() with graph_mode=True
                  encode_total_mass : bool = False, # Tells whether to encode the input multiset sizes (a.k.a. total mass) in the embedding
                  total_mass_encoding_function : str = 'identity', # 'identity' : f(x)=x, 'sqrt' : f(x) = sqrt(1+x)-1, 'log' : log(1+x)
+                 total_mass_encoding_scale : int | float = 1.0,                 
                  total_mass_encoding_method : str = 'plain', # 'plain' / 'homog' / 'homog_alt'
                  total_mass_pad_thresh : float | int = 1.0, # Multisets/mesaures with a total mass below that threshold get padded with the complementary mass placed at x=0
-                 learnable_slices : bool = False, learnable_freqs : bool = False, learnable_powers : bool = False,
+                 learnable_slices : bool = False, learnable_freqs : bool = False, learnable_total_mass_encoding_scale : bool = False,
                  freqs_init : float | int | str | tuple[float,float] = 'random',
                  minimize_slice_coherence : bool = False,
                  enable_bias : bool = True,
@@ -217,6 +219,7 @@ class FSW_embedding(nn.Module):
 
         self.encode_total_mass = encode_total_mass
         self.total_mass_encoding_dim = 1 if self.encode_total_mass else 0
+        self.total_mass_encoding_scale_init = total_mass_encoding_scale
 
         total_mass_pad_thresh = float(total_mass_pad_thresh)
         assert not np.isinf(total_mass_pad_thresh), 'total_mass_pad_thresh cannot be inf'
@@ -267,7 +270,7 @@ class FSW_embedding(nn.Module):
 
         self.learnable_slices = learnable_slices
         self.learnable_freqs = learnable_freqs
-        self.learnable_powers = learnable_powers
+        self.learnable_total_mass_encoding_scale = learnable_total_mass_encoding_scale
 
         # Note: freqs_init is checked for correctness downstream at generate_embedding_parameters()
         self.freqs_init = freqs_init
@@ -376,11 +379,12 @@ class FSW_embedding(nn.Module):
 
         # Generate projection vectors and frequencies
         # We always generate (and optimize) them in float64 and then convert to the desired dtype.
-        projVecs, freqs, bias = FSW_embedding.generate_embedding_parameters(d_in=self.d_in+self.d_edge, 
+        projVecs, freqs, bias, total_mass_encoding_scale = FSW_embedding.generate_embedding_parameters(d_in=self.d_in+self.d_edge, 
                                                                            nSlices=self.nSlices, nFreqs=self.nFreqs,
                                                                            cartesian_mode=self.cartesian_mode,
                                                                            collapse_freqs=self.collapse_freqs,
                                                                            total_mass_encoding_dim=self.total_mass_encoding_dim,
+                                                                           total_mass_encoding_scale_init=self.total_mass_encoding_scale_init,
                                                                            freqs_init=self.freqs_init,
                                                                            minimize_slice_coherence=self.minimize_slice_coherence,
                                                                            device=device,
@@ -400,6 +404,9 @@ class FSW_embedding(nn.Module):
                 bias = bias.reshape((self.nSlices*self.nFreqs))
 
             self.bias = nn.Parameter( bias, requires_grad=self.learnable_slices )
+
+        if self.encode_total_mass:
+            self.total_mass_encoding_scale = nn.Parameter( total_mass_encoding_scale, requires_grad=self.learnable_total_mass_encoding_scale )
 
         # This also initializes the .device and .dtype fields
         self.to(device=self.get_device(), dtype=self.get_dtype())
@@ -435,7 +442,8 @@ class FSW_embedding(nn.Module):
     
 
 
-    def generate_embedding_parameters(d_in, nSlices, nFreqs, cartesian_mode, collapse_freqs, total_mass_encoding_dim,
+    def generate_embedding_parameters(d_in, nSlices, nFreqs, cartesian_mode, collapse_freqs,
+                                      total_mass_encoding_dim, total_mass_encoding_scale_init,
                                       freqs_init, minimize_slice_coherence, device, report, report_on_coherence_minimization):
         dtype_init = torch.float64
 
@@ -528,9 +536,14 @@ class FSW_embedding(nn.Module):
 
         bias = torch.zeros(size=bias_shape, dtype=dtype_init, device=device)
 
+        if total_mass_encoding_dim > 0:
+            total_mass_encoding_scale = torch.tensor(total_mass_encoding_scale_init, device=device, dtype=dtype_init)
+        else:
+            total_mass_encoding_scale = None
+
         qprintln(report)
 
-        return projVecs, freqs, bias
+        return projVecs, freqs, bias, total_mass_encoding_scale
 
 
 
@@ -842,6 +855,9 @@ class FSW_embedding(nn.Module):
             
             del W_sum
             
+            print('Total mass scale: ', self.total_mass_encoding_scale, 'requires grad: ', self.total_mass_encoding_scale.requires_grad)
+            total_mass *= self.total_mass_encoding_scale
+
             if self.total_mass_encoding_method == 'plain':
                 X_emb = torch.cat( (total_mass, X_emb), dim=-1)
             elif self.total_mass_encoding_method == 'homog':

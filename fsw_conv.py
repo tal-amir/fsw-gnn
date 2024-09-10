@@ -15,6 +15,7 @@ import type_enforced # Note: A runtime error in this line implies that that some
 from typing import Dict, Any
 import inspect
 
+#TODO: Check if this path update is necessary
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 mydir = os.path.dirname(os.path.abspath(__file__))
@@ -76,6 +77,10 @@ class FSW_conv(MessagePassing):
     #                                  'sqrt': f(x) = sqrt(1+x)-1
     #                                  'log': f(x) = log(1+x)
     #                                  default: 'identity'
+    #
+    # vertex_degree_encoding_scale: factor to multiply the vertex degree encodings.
+    #                               is learnable when learnable_embedding=True.
+    #                               default: 1.0
     #
     # homog_degree_encoding: tells whether the neighborhood-size encoding should be homogeneous.
     #                        better keep this off unless it is desired that the model should be homogeneous.
@@ -153,7 +158,7 @@ class FSW_conv(MessagePassing):
     def __init__(self,
                  in_channels, out_channels, edgefeat_dim=0,
                  embed_dim=None, learnable_embedding=True,
-                 encode_vertex_degrees=True, vertex_degree_encoding_function='identity', homog_degree_encoding=False, 
+                 encode_vertex_degrees=True, vertex_degree_encoding_function='identity', vertex_degree_encoding_scale=1.0, homog_degree_encoding=False, 
                  vertex_degree_pad_thresh = 1.0,
                  concat_self = True,
                  bias=True,
@@ -196,7 +201,7 @@ class FSW_conv(MessagePassing):
     def init_helper(self,
                     in_channels, out_channels, edgefeat_dim,
                     embed_dim, learnable_embedding,
-                    encode_vertex_degrees, vertex_degree_encoding_function, homog_degree_encoding, 
+                    encode_vertex_degrees, vertex_degree_encoding_function, vertex_degree_encoding_scale, homog_degree_encoding, 
                     vertex_degree_pad_thresh,
                     concat_self,
                     bias,
@@ -297,9 +302,10 @@ class FSW_conv(MessagePassing):
         self.size_coeff = torch.nn.Parameter( torch.ones(1, device=device, dtype=dtype) / np.sqrt(embed_dim), requires_grad=learnable_embedding)
 
         self.fsw_embed = FSW_embedding(d_in=in_channels, d_out=embed_dim, d_edge=edgefeat_dim,
-                                       learnable_slices=learnable_embedding, learnable_freqs=learnable_embedding,
+                                       learnable_slices=learnable_embedding, learnable_freqs=learnable_embedding, learnable_total_mass_encoding_scale = learnable_embedding,
                                        encode_total_mass = encode_vertex_degrees, 
                                        total_mass_encoding_function = vertex_degree_encoding_function,
+                                       total_mass_encoding_scale = vertex_degree_encoding_scale,
                                        total_mass_encoding_method = embedding_total_mass_encoding_method, 
                                        total_mass_pad_thresh = vertex_degree_pad_thresh,
                                        minimize_slice_coherence=True, freqs_init='spread',
