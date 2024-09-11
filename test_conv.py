@@ -42,7 +42,7 @@ data = Data(x=node_features, edge_index=edge_index)
 
 conv = FSW_conv(vertex_feature_dim, out_dim, edgefeat_dim=edge_feature_dim, mlp_layers=3, bias=not is_homogeneous,
                 vertex_degree_encoding_function=vertex_degree_encoding_function, 
-                vertex_degree_encoding_scale=10,
+                vertex_degree_encoding_scale=1, learnable_vertex_degree_encoding_scale=True,
                 homog_degree_encoding=is_homogeneous, 
                 learnable_embedding = True,
                 concat_self = True, batchNorm_final=True, device=device, dtype=dtype, self_loop_weight=0.2)
@@ -55,6 +55,9 @@ edge_index = edge_index.to(device=device)
 # Apply one iteration of SW message passing
 out = conv(node_features, edge_index=edge_index, edge_features=edge_features)
 out2 = conv(16*node_features, edge_index=edge_index, edge_features=16*edge_features)
+
+obj = out.norm()
+obj.backward()
 
 print('')
 print('Forward pass went ok')
@@ -69,4 +72,15 @@ if test_homogeneity:
         print('Relative deviation from homogeneity: ', torch.norm(out2-16*out).item() / torch.norm(out).item())
     else:
         print('Relative deviation from homogeneity: ', torch.norm(out2-16*out).item() / torch.norm(out).item(), '(this is ok since is_homogeneous=False)')
+
+print('Vertex degree scale: %g  Grad: %g' % (conv.fsw_embed.total_mass_encoding_scale, conv.fsw_embed.total_mass_encoding_scale.grad))
+optimizer = torch.optim.SGD(conv.parameters(), lr=0.01)  # Learning rate 0.01
+
+for i in range(10):
+    optimizer.step()
+    optimizer.zero_grad()
+    out = conv(node_features, edge_index=edge_index, edge_features=edge_features)
+    obj = out.norm()
+    obj.backward()
+    print('Vertex degree scale: %g  Grad: %g' % (conv.fsw_embed.total_mass_encoding_scale, conv.fsw_embed.total_mass_encoding_scale.grad))
 

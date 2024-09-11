@@ -456,12 +456,25 @@ class FSW_embedding(nn.Module):
         projVecs = nn.functional.normalize(projVecs, p=2.0, dim=ambspace_axis, eps=0, out=None)
 
         if minimize_slice_coherence:
-            if nSlices > d_in:
+            # We use mutual-coherence minimization even when nSlices <= d_in, where we could use
+            # the QR or SVD methods below, since in low-memory conditions these methods sometimes
+            # crash out of memory, whereas minimize_mutual_coherence() works well.
+            #TODO: Deal with degenerate cases such as d_in = 1 or nSlices=1, nSlices=0
+            if (nSlices > d_in) or True:
                 projVecs = minimize_mutual_coherence(projVecs, report=report_on_coherence_minimization)
                 qprintln(report, '- Generated %d projection vectors in R^%d with minimized mutual coherence' % (nSlices, d_in))
             else:
-                projVecs, _ = torch.linalg.qr(projVecs.transpose(0,1), mode='reduced')
-                projVecs = projVecs.transpose(0,1)
+                # Here we need to compute a set of nSlices orthogonal vectors in R^d_in.
+                # Below are two methods to do so: SVD and QR decomposition.
+                if True:
+                    U, S, Vh = torch.linalg.svd(projVecs, full_matrices=False)
+                    projVecs = Vh
+                    del U, S, Vh
+                else:                    
+                    projVecs = projVecs.transpose(0,1)
+                    projVecs, R = torch.linalg.qr(projVecs, mode='reduced')
+                    del R
+                    projVecs = projVecs.transpose(0,1)
                 qprintln(report, '- Generated %d perpendicular projection vectors in R^%d using QR decomposition' % (nSlices, d_in))
         else:
             qprintln(report, '- Generated %d random projection vectors' % (nSlices))
@@ -855,7 +868,7 @@ class FSW_embedding(nn.Module):
             
             del W_sum
             
-            print('Total mass scale: ', self.total_mass_encoding_scale, 'requires grad: ', self.total_mass_encoding_scale.requires_grad)
+            #print('Total mass scale: ', self.total_mass_encoding_scale.item(), 'requires grad: ', self.total_mass_encoding_scale.requires_grad)
             total_mass *= self.total_mass_encoding_scale
 
             if self.total_mass_encoding_method == 'plain':
