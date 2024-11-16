@@ -4,8 +4,8 @@
 # Technion Institute of Technology
 # Haifa, Israel
 
-version = '2.13'
-version_date = '2024-00-10'
+version = '2.14'
+version_date = '2024-09-30'
 
 # Edge features:
 # - Do not split self.projVecs. Do self.projVecs.shape[1] == d_in + d_edge.
@@ -200,7 +200,7 @@ class FSW_embedding(nn.Module):
                 qprintln(report, 'Loaded custom CUDA library \'%s\'' % (libfsw_embedding_path))
             except OSError as e:
                 if fsw_embedding_produce_error_on_custom_library_loading_failure:
-                    raise RuntimeError('Error loading custom CUDA library \'%s\'. To circumvent this, set load_custom_cuda_lib=False at FSW_embedding() init, or set fsw_embedding_produce_error_on_custom_library_loading_failure=False at FSW_embedding.py code. This will use pure PyTorch code instead of the custom CUDA library, which is a bit slower.' % (libfsw_embedding_path))
+                    raise RuntimeError('Error loading custom CUDA library \'%s\'. Try rebuilding it by running the script file \'build_fsw_embedding\' found at the same directory. If this doesn\'t help, this error can be circumvented by setting load_custom_cuda_lib=False at FSW_embedding() init, or setting fsw_embedding_produce_error_on_custom_library_loading_failure=False at FSW_embedding.py code. This will use pure PyTorch code instead of the custom CUDA library, which is a bit slower.' % (libfsw_embedding_path))
                 elif self.user_warnings:
                     warnings.warn('Could not load custom CUDA library \'%s\'. Using pure torch implementation, which is a bit slower. (To silence, set user_warnings=False at FSW_embedding() init)' % (libfsw_embedding_path), UserWarning)
                 libfsw_embedding = None
@@ -287,7 +287,7 @@ class FSW_embedding(nn.Module):
         self.report_on_coherence_minimization = report_on_coherence_minimization
 
         qprintln(report)
-        qprintln(report, 'Sliced-Wasserstein Embedding')
+        qprintln(report, 'Fourier Sliced-Wasserstein Embedding')
         qprintln(report, 'version %s, %s' % (version, version_date))
 
         qprintln(report)
@@ -295,7 +295,7 @@ class FSW_embedding(nn.Module):
         qprintln(report, 'Technion Institute of Technology, Haifa, Israel')
 
         qprintln(report)
-        qprintln(report, 'Based on our paper titled "Fourier Sliced-Wasserstrin Embedding for Multisets and Distributions", 2024')
+        qprintln(report, 'Based on our paper titled "Fourier Sliced-Wasserstrin Embedding for Multisets and Measures", 2024')
 
         qprintln(report)
         qprintln(report, 'Constructing embedding for sets in %s into %s  ' % (input_space_name, output_space_name))
@@ -3086,6 +3086,9 @@ def minimize_mutual_coherence_p(X_init, p, step_size_init, improvement_thresh, n
     # Initialization
     n = X_init.shape[0]
 
+    if X_init.numel()==0:
+        return X_init, step_size_init
+    
     onevec = torch.ones([n,1], dtype=X_init.dtype, device=X_init.device)
 
     mu_init = calc_mu_from_G(calc_G(X_init))
