@@ -3089,7 +3089,7 @@ def minimize_mutual_coherence_p(X_init, p, step_size_init, improvement_thresh, n
     if X_init.numel() == 0:
         return X_init, step_size_init
     elif n == 1:
-        return torch.normalize(X_init)
+        return torch.normalize(X_init), step_size_init
     
     onevec = torch.ones([n,1], dtype=X_init.dtype, device=X_init.device)
 
