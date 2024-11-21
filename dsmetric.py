@@ -25,6 +25,8 @@ def dsmetric(A1, V1, A2, V2, lambda_features=1, use_squared_dists=False, return_
     assert n == n2, "Graph sizes (number of nodes) must match."
     assert d == d2, "Feature dimensions must match."
 
+    assert not (A1.is_sparse or A2.is_sparse or V1.is_sparse or V2.is_sparse), 'All input tensors must be dense'
+
     # Convert PyTorch tensors to NumPy arrays for CVXPY
     A1_np = A1.detach().numpy()
     V1_np = V1.detach().numpy()
