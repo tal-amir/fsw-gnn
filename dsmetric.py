@@ -2,7 +2,11 @@ import torch
 import cvxpy as cp
 import numpy as np
 
-def dsmetric(A1, V1, A2, V2, l=1):
+def dsmetric(A1, V1, A2, V2, lambda_features=1, use_squared_dists=False):
+    # (A1, V1) and (A2, V2) are the adjacency matrix and corresponding vertex-feature matrix of the two input graphs
+    # A1, A2 should be of size n x n; V1, V2 should be of use n x d.
+    # lambda_features is the weight of the vertex-feature term in the objective.
+    
     [n, d] = V1.shape
     [n2, d2] = V2.shape
     
@@ -17,7 +21,7 @@ def dsmetric(A1, V1, A2, V2, l=1):
 
     # Compute pairwise differences in NumPy
     diff = V1_np[:, None, :] - V2_np[None, :, :]  # Shape (n, n, d)
-    norms = np.linalg.norm(diff, axis=2)  # Shape (n, n)
+    dists = np.linalg.norm(diff, axis=2)  # Shape (n, n)
 
     # Define CVXPY variable for S
     S = cp.Variable((n, n))
@@ -31,10 +35,14 @@ def dsmetric(A1, V1, A2, V2, l=1):
 
     # Objective terms
     structure_term = cp.norm(A1_np @ S - S @ A2_np, "fro")
-    feature_term = cp.sum(cp.multiply(S, norms))
+
+    if use_squared_dists:
+        feature_term = cp.sqrt(cp.sum(cp.multiply(S, dists**2)))
+    else:
+        feature_term = cp.sum(cp.multiply(S, dists))
 
     # Define and solve the optimization problem
-    objective = cp.Minimize(l * structure_term + feature_term)
+    objective = cp.Minimize(structure_term + lambda_features*feature_term)
     problem = cp.Problem(objective, constraints)
     problem.solve()
 
