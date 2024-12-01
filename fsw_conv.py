@@ -102,6 +102,10 @@ class FSW_conv(MessagePassing):
     #              is applied after the concatenation to yield a vector of dimension <out_channels>.
     #              note that when set to False, the network is not fully expressive.
     #              Default: True
+    #
+    # message_weight_vs_self: when concat_self is set to True,  controls the weight of the self vertex feature when computing
+    #                         the output feature. The self feature part of the output feature gets multiplied by
+    #                         message_weight_vs_self. 
     #                   
     # self_loop_weight: NOTE: There is no need to use this anymore, since the new FSW embedding can elegantly handle empty sets.
     #                         Better use the default self_loop_weight = 0
@@ -164,7 +168,7 @@ class FSW_conv(MessagePassing):
                  encode_vertex_degrees=True, vertex_degree_encoding_function='identity', 
                  vertex_degree_encoding_scale=1.0, learnable_vertex_degree_encoding_scale=False, homog_degree_encoding=False, 
                  vertex_degree_pad_thresh = 1.0,
-                 concat_self = True,
+                 concat_self = True, message_weight_vs_self=1.0,
                  bias=True,
                  mlp_layers=1, mlp_hidden_dim=None,
                  mlp_activation_final = torch.nn.LeakyReLU(negative_slope=0.2), 
@@ -208,7 +212,7 @@ class FSW_conv(MessagePassing):
                     encode_vertex_degrees, vertex_degree_encoding_function, 
                     vertex_degree_encoding_scale, learnable_vertex_degree_encoding_scale, homog_degree_encoding, 
                     vertex_degree_pad_thresh,
-                    concat_self,
+                    concat_self, message_weight_vs_self,
                     bias,
                     mlp_layers, mlp_hidden_dim,
                     mlp_activation_final, 
@@ -239,6 +243,7 @@ class FSW_conv(MessagePassing):
         self.concat_self = concat_self
         self.edge_weighting = edge_weighting
         self.self_loop_weight = self_loop_weight
+        self.message_weight_vs_self = message_weight_vs_self
 
         # if mlp_layers=0, mlp_input_dim is used also to determine the size of the dimensionality-reduction matrix
         if concat_self:
@@ -350,7 +355,7 @@ class FSW_conv(MessagePassing):
         emb = self.fsw_embed(X=vertex_features, W=adj, X_edge=X_edge, graph_mode=True, serialize_num_slices=None)
 
         if self.concat_self:
-            emb = torch.cat((emb, vertex_features), dim=-1)
+            emb = torch.cat((self.message_weight_vs_self*emb, vertex_features), dim=-1)
 
         # Apply MLP or dimensionality reduction to neighborhood embeddings
         if self.mlp is not None:
