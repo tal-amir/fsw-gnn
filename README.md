@@ -2,7 +2,7 @@
 
 1. Download the files listed below.
 2. Experiment with the minimal working examples: `demo_conv.py` or `demo_fsw_embedding.py`  
-   In case of any problem, run `build_fsw_embedding`
+   - In case of any problem, run `build_fsw_embedding`
 
 ## Files
 
